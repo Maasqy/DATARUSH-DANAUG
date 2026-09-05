@@ -1475,10 +1475,12 @@ def render_map_component(initial_abbr=None, initial_county=None, key="map_dashbo
 def process_map_click(map_value):
     """Reacciona al valor que devuelve el componente del mapa cuando el
     usuario hace click en un estado/condado (ver reportCountyClick en el
-    JS). Se llama SIEMPRE que se dibuja el mapa -- con Dashboards abierto o
-    cerrado -- para que un click funcione igual sin importar desde que
-    vista se haga (antes solo se procesaba dentro del bloque de
-    Dashboards, asi que un click en la vista por defecto no hacia nada).
+    JS), sincronizando los dropdowns/graficas de Dashboards con esa
+    seleccion. A proposito solo se llama DENTRO del bloque de Dashboards
+    (mas abajo) -- Dashboards es opt-in (solo se abre con su boton), asi
+    que un click en el mapa hecho desde la vista de afuera NUNCA debe abrir
+    el panel por su cuenta; ahi el click solo mueve el mapa (eso ya lo hace
+    el JS del lado del cliente).
 
     "seq" sube en cada click -- sin compararlo contra el ultimo que ya
     procesamos, el mismo valor (que Streamlit sigue devolviendo en cada
@@ -1636,7 +1638,12 @@ if st.session_state.show_dashboard and MAP_DATA:
         st.session_state.dash_closing = False
         st.rerun()
 else:
-    process_map_click(render_map_component())
+    # OJO: aca NO se llama process_map_click -- Dashboards es opt-in (solo
+    # se abre con el boton de arriba), asi que un click en un estado desde
+    # esta vista de afuera solo debe navegar el mapa (eso ya lo hace el JS
+    # del lado del cliente, adentro del componente) y nunca debe abrir el
+    # panel de Dashboards por su cuenta.
+    render_map_component()
 
 # La leyenda va pegada al mapa a proposito (antes vivia mas abajo, pero el
 # panel de IA -- que puede crecer bastante con la respuesta -- la terminaba
