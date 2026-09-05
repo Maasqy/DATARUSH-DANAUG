@@ -4,9 +4,13 @@ dashboards (ver MapaUS.py). Vive en un modulo aparte a proposito:
 
   - La API key SOLO se lee y se usa aqui, del lado servidor -- este codigo
     corre dentro del proceso de Streamlit (nunca en el navegador), asi que
-    la clave jamas llega al frontend ni se envia al cliente. Se lee de la
-    variable de entorno GEMINI_API_KEY (definida en .env, que esta en
-    .gitignore) via python-dotenv.
+    la clave jamas llega al frontend ni se envia al cliente. En local se lee
+    de la variable de entorno GEMINI_API_KEY (definida en .env, que esta en
+    .gitignore) via python-dotenv; en Streamlit Community Cloud (donde .env
+    nunca se sube -- por eso mismo esta en .gitignore) se lee de st.secrets,
+    que es donde ese hosting guarda los "Secrets" configurados desde el
+    dashboard de la app. Se intenta primero la variable de entorno y despues
+    st.secrets, asi que cualquiera de las dos formas de configurarla sirve.
   - MapaUS.py arma el contexto compacto (estado/condado + sus indicadores
     ya calculados, reutilizando get_state_entry/get_county_entry) y llama a
     generate_analysis(context); este modulo solo sabe convertir ese
@@ -25,8 +29,27 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-lite-latest").strip() or "gemini-flash-lite-latest"
+
+def _get_config(key, default=""):
+    """Variable de entorno / .env primero (uso local); si no esta, cae a
+    st.secrets (Streamlit Community Cloud). st.secrets tira una excepcion
+    propia si no existe NINGUN secrets.toml configurado (caso normal en
+    local, donde solo hay .env) -- por eso el try/except en vez de un
+    .get() directo."""
+    value = os.environ.get(key, "").strip()
+    if value:
+        return value
+    try:
+        import streamlit as st
+
+        value = str(st.secrets.get(key, "")).strip()
+    except Exception:
+        value = ""
+    return value or default
+
+
+GEMINI_API_KEY = _get_config("GEMINI_API_KEY")
+GEMINI_MODEL = _get_config("GEMINI_MODEL", "gemini-flash-lite-latest")
 
 REQUIRED_SECTIONS = [
     "Resumen de la situacion",
