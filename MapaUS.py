@@ -851,16 +851,29 @@ HTML_TEMPLATE = r"""
   html, body { margin:0; padding:0; height:100%; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
   #app { position:relative; width:100%; height:720px; }
   #nation-svg {
-    position:absolute; inset:0; width:100%; height:100%; transition:opacity .4s ease;
+    position:absolute; inset:0; width:100%; height:100%;
+    transition:opacity .45s ease, transform .45s ease;
+    transform-origin:center center; transform:scale(1);
     background-color:#eef2ef; background-image:__NATION_BG_CSS__;
     background-size:contain; background-position:center; background-repeat:no-repeat;
   }
   #state-svg {
-    position:absolute; inset:0; width:100%; height:100%; transition:opacity .4s ease;
+    position:absolute; inset:0; width:100%; height:100%;
+    transition:opacity .45s ease, transform .45s ease;
+    transform-origin:center center; transform:scale(1);
     background-color:#eef2ef;
   }
   #map { position:absolute; inset:0; z-index:1; transition:opacity .4s ease; }
   .view-hidden { opacity:0; pointer-events:none; }
+  /* El "zoom hacia/desde el centro" solo aplica a las dos vistas SVG (pais
+     y estado) -- el mapa real (#map, Leaflet) se queda solo con el fade de
+     .view-hidden de arriba, porque escalarlo con CSS mientras esta oculto
+     desincroniza el tamano que Leaflet cree que tiene (invalidateSize ya se
+     encarga de acomodarlo, pero no espera un transform por fuera suyo). Al
+     entrar a un estado, nation-svg se encoge hacia su centro (sale) y
+     state-svg crece desde ese mismo centro (entra) -- y al reves al volver.
+  */
+  #nation-svg.view-hidden, #state-svg.view-hidden { transform:scale(0); }
   #control-card {
     position:absolute; top:14px; left:14px; z-index:5;
     background:rgba(255,255,255,.96); border-radius:10px; padding:10px 12px;
@@ -1555,6 +1568,18 @@ if st.session_state.show_dashboard and MAP_DATA:
                 "Modo", ["Estado completo", "Estado y condado", "Comparar estados"],
                 horizontal=True, label_visibility="collapsed", key="dash_mode",
             )
+            # Cambiar de modo agrega o quita widgets enteros mas abajo (el
+            # selectbox de condado, el multiselect de comparar) en el MISMO
+            # render que el click que los dispara -- eso a veces deja al
+            # navegador mostrando un estado a medio asentar hasta el
+            # siguiente render (por eso hacia falta clickear dos veces).
+            # Forzar un rerun apenas se detecta el cambio le da ese segundo
+            # render gratis, sin que el usuario tenga que pedirlo con otro
+            # click -- mismo truco que ya se uso para el boton de
+            # Dashboards y el de Ocultar/Mostrar del panel de IA.
+            if st.session_state.get("_last_dash_mode") != _mode:
+                st.session_state["_last_dash_mode"] = _mode
+                st.rerun()
             _compare_abbrs = []
             if _mode == "Comparar estados":
                 _compare_names = st.multiselect(
