@@ -5,3 +5,5 @@ cb_zcta520/
 cb_zcta520_500k.zip
 cb_county500k/
 cb_2020_us_county_500k.zip
+map_component/
+.env

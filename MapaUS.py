@@ -24,12 +24,51 @@ Ejecutar:
 """
 import base64
 import json
+import re
+import time
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
+import gemini_service
+
 st.set_page_config(page_title="Fifty States, One Territory", page_icon="\U0001F5FA", layout="wide")
+
+# Transiciones del panel de Dashboards: st.container(key=...) expone su div
+# como clase CSS "st-key-<key>" (API oficial de Streamlit), asi que animamos
+# entrada/salida cambiando de key en vez de tocar el DOM a mano. El area de
+# graficas usa una key que depende del estado/condado elegido, para que al
+# cambiar la seleccion se vuelva a montar (y por lo tanto reanime) solo esa
+# parte, sin repetir la animacion de todo el panel.
+st.markdown(
+    """
+    <style>
+    @keyframes dashFadeIn {
+        from { opacity: 0; transform: translateY(-10px); }
+        to   { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes dashFadeOut {
+        from { opacity: 1; transform: translateY(0); }
+        to   { opacity: 0; transform: translateY(-8px); }
+    }
+    .st-key-dash_section_open { animation: dashFadeIn 0.3s ease-out; }
+    [class*="st-key-dash_charts_sel_"] { animation: dashFadeIn 0.28s ease-out; }
+    /* Salida: solo las graficas se animan (dashFadeOut) al cerrar. Los
+       controles y el mapa NO pueden usar este mismo truco -- cambiarles la
+       key para reanimarlos le borra el valor a los widgets que tienen
+       adentro (el dropdown de estado/condado, el mapa) -- ver el
+       comentario junto a esos containers en el codigo. */
+    .st-key-dash_charts_closing { animation: dashFadeOut 0.16s ease-in forwards; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+def _slug(text):
+    return re.sub(r"[^a-z0-9]+", "-", str(text).lower()).strip("-") or "x"
 
 REGIONS = {
     "NE":   {"label": "Northeast", "color": "#3a7c76"},
@@ -43,12 +82,12 @@ REGIONS = {
 # mapa nacional por ZCTA5 (build_zcta_vulnerability_map.py) y que el atlas
 # web, para que todo el proyecto use el mismo lenguaje visual.
 VULN_BANDS = [
-    {"key": "low",      "label": "Baja",      "max": 10,        "color": "#0ca30c"},
-    {"key": "moderate", "label": "Moderada",  "max": 15,        "color": "#fab219"},
-    {"key": "high",     "label": "Alta",      "max": 20,        "color": "#ec835a"},
-    {"key": "severe",   "label": "Severa",    "max": float("inf"), "color": "#d03b3b"},
+    {"key": "low",      "label": "Baja",      "max": 10,        "color": "#14532d"},
+    {"key": "moderate", "label": "Moderada",  "max": 15,        "color": "#22c55e"},
+    {"key": "high",     "label": "Alta",      "max": 20,        "color": "#a3e635"},
+    {"key": "severe",   "label": "Severa",    "max": float("inf"), "color": "#fef08a"},
 ]
-VULN_NO_DATA_COLOR = "#9aa39c"
+VULN_NO_DATA_COLOR = "#fff7ed"
 
 
 def vuln_band(v):
@@ -170,6 +209,30 @@ if MAP_DATA:
 
 NAME_TO_ABBR = {v["name"]: k for k, v in STATES.items()}
 
+if "show_dashboard" not in st.session_state:
+    st.session_state.show_dashboard = False
+if "dash_closing" not in st.session_state:
+    st.session_state.dash_closing = False
+
+# Un click en el mapa (dentro de col_map, mas abajo) no puede escribir
+# directo en st.session_state["dash_mode"] / "dash_state_name" / etc: esos
+# widgets ya se instanciaron ANTES en ese mismo run (estan mas arriba en el
+# layout), y Streamlit prohibe modificar el estado de un widget ya creado en
+# el run actual (tira StreamlitWidgetAlreadyInstantiatedError). Por eso ese
+# click solo deja "_pending_map_click" y pide un rerun; aqui, arriba de
+# todo -- antes de que se cree ningun widget del dashboard -- es donde se
+# aplica de verdad.
+if "_pending_map_click" in st.session_state:
+    _pending_click = st.session_state.pop("_pending_map_click")
+    _pending_abbr = _pending_click.get("abbr")
+    _pending_county = _pending_click.get("county")
+    if _pending_abbr in STATES:
+        st.session_state.show_dashboard = True
+        st.session_state["dash_mode"] = "Estado y condado" if _pending_county else "Estado completo"
+        st.session_state["dash_state_name"] = STATES[_pending_abbr]["name"]
+        if _pending_county:
+            st.session_state[f"dash_county_name_{_pending_abbr}"] = _pending_county
+
 # Contorno real de los 50 estados + D.C., guardado localmente (no se descarga
 # en cada carga de la pagina): fuente PublicaMundi/MappingAPI, dominio publico.
 STATES_GEOJSON = json.loads((Path(__file__).parent / "us_states.json").read_text(encoding="utf-8"))
@@ -186,6 +249,297 @@ COUNTY_SHAPES = (
     json.loads(_county_shapes_path.read_text(encoding="utf-8"))
     if _county_shapes_path.exists() else {}
 )
+
+# --------------------------------------------------------------------
+# Dashboards: mismos datos de map_data.json (estado completo o un
+# condado/municipio dentro de el), mostrados como graficas junto al mapa
+# en vez de como pines/tooltips.
+# --------------------------------------------------------------------
+COMPONENT_LABELS = {
+    "POV150": "Pobreza (<150% FPL)",
+    "UNEMP": "Desempleo",
+    "NOHSDP": "Sin diploma",
+    "BROAD": "Sin banda ancha",
+    "HCOST": "Costo de vivienda",
+    "CROWD": "Hacinamiento",
+    "SNGPNT": "Hogares monoparentales",
+}
+HEALTH_LABELS = {
+    "ACCESS2": "Sin seguro medico",
+    "OBESITY": "Obesidad",
+    "DIABETES": "Diabetes",
+    "CSMOKING": "Tabaquismo",
+    "CHECKUP": "Chequeo medico anual",
+    "DENTAL": "Visita dental anual",
+}
+
+
+def get_state_entry(abbr):
+    return MAP_DATA["states"].get(abbr) if MAP_DATA else None
+
+
+def get_county_entry(abbr, county_name):
+    state_entry = get_state_entry(abbr)
+    if not state_entry:
+        return None
+    return next((c for c in state_entry["counties"] if c["name"] == county_name), None)
+
+
+def render_dashboard(abbr, county_name):
+    entry = get_county_entry(abbr, county_name) if county_name else get_state_entry(abbr)
+    label = county_name or STATES[abbr]["name"]
+    kind = "Condado / municipio" if county_name else "Estado completo"
+
+    st.markdown(f"#### {label}")
+    st.caption(kind)
+
+    if not entry or entry.get("vulnerability") is None:
+        st.info(f"No hay datos SDOH suficientes para **{label}** (comun en Puerto Rico y zonas sin poblacion).")
+        return
+
+    band = vuln_band(entry["vulnerability"])
+    m1, m2 = st.columns(2)
+    m1.metric(
+        "Vulnerabilidad (SDOH)",
+        entry["vulnerability"],
+        (band["label"] if band else None),
+        delta_color="off",
+    )
+    m2.metric("Poblacion", f"{int(entry['population']):,}" if entry.get("population") else "-")
+
+    nat_comp = MAP_DATA["national"]["components"]
+    comp = entry["components"]
+    df_comp = pd.DataFrame(
+        {
+            label: [comp.get(k) for k in COMPONENT_LABELS],
+            "Media nacional": [nat_comp.get(k) for k in COMPONENT_LABELS],
+        },
+        index=list(COMPONENT_LABELS.values()),
+    )
+    st.caption("Componentes de vulnerabilidad social (%)")
+    st.bar_chart(df_comp, horizontal=True, height=280)
+
+    health = entry.get("health") or {}
+    if any(v is not None for v in health.values()):
+        nat_health = MAP_DATA["national"]["health"]
+        df_health = pd.DataFrame(
+            {
+                label: [health.get(k) for k in HEALTH_LABELS],
+                "Media nacional": [nat_health.get(k) for k in HEALTH_LABELS],
+            },
+            index=list(HEALTH_LABELS.values()),
+        )
+        st.caption("Indicadores de salud (%)")
+        st.bar_chart(df_health, horizontal=True, height=250)
+
+    ctx = entry.get("context") or {}
+    if ctx.get("REMNRTY") is not None or ctx.get("AGE65") is not None:
+        c1, c2 = st.columns(2)
+        if ctx.get("REMNRTY") is not None:
+            c1.metric("Minoria racial/etnica", f"{ctx['REMNRTY']}%")
+        if ctx.get("AGE65") is not None:
+            c2.metric("65 anios o mas", f"{ctx['AGE65']}%")
+
+
+# --------------------------------------------------------------------
+# Analisis con IA (Gemini): arma un contexto compacto -- nunca el dataset
+# completo -- reutilizando get_state_entry/get_county_entry (los mismos
+# que usa render_dashboard) y se lo manda a gemini_service, que vive en su
+# propio modulo para no mezclar la llamada al modelo con la UI. La API key
+# solo se lee ahi, del lado servidor -- nunca llega al navegador.
+# --------------------------------------------------------------------
+def _entry_metrics(entry):
+    if not entry or entry.get("vulnerability") is None:
+        return None
+    comp = entry.get("components") or {}
+    health = entry.get("health") or {}
+    ctx = entry.get("context") or {}
+    has_health = any(v is not None for v in health.values())
+    band = vuln_band(entry["vulnerability"])
+    return {
+        "poblacion": entry.get("population"),
+        "vulnerabilidadSDOH": entry["vulnerability"],
+        "bandaVulnerabilidad": band["label"] if band else None,
+        "componentesSDOH_pct": {COMPONENT_LABELS[k]: comp.get(k) for k in COMPONENT_LABELS},
+        "indicadoresSalud_pct": (
+            {HEALTH_LABELS[k]: health.get(k) for k in HEALTH_LABELS} if has_health else None
+        ),
+        "minoriaRacialEtnica_pct": ctx.get("REMNRTY"),
+        "mayores65_pct": ctx.get("AGE65"),
+    }
+
+
+def build_ai_context(abbr, county_name):
+    """Objeto compacto que se le manda a Gemini -- nunca el dataset
+    completo, solo los indicadores de la seleccion activa (ver el shape
+    pedido: selectionLevel "state"/"county" + dashboardContext)."""
+    nat = MAP_DATA["national"] if MAP_DATA else None
+    dashboard_context = {
+        "dateRange": (
+            "Snapshot mas reciente disponible en el proyecto (CDC PLACES + AHRQ SDOH); "
+            "no hay serie temporal ni rango de fechas."
+        ),
+        "activeFilters": {
+            "modo": "Estado y condado" if county_name else "Estado completo",
+            "estado": STATES[abbr]["name"],
+            "condado": county_name,
+        },
+        "dataSource": "integrated_data_by_state.csv (CDC PLACES + AHRQ SDOH, agregado por condado y estado)",
+    }
+    national_reference = (
+        {
+            "vulnerabilidadSDOH": nat["vulnerability"],
+            "componentesSDOH_pct": {COMPONENT_LABELS[k]: nat["components"].get(k) for k in COMPONENT_LABELS},
+        }
+        if nat else None
+    )
+
+    context = {
+        "selectionLevel": "county" if county_name else "state",
+        "state": {"name": STATES[abbr]["name"], "metrics": _entry_metrics(get_state_entry(abbr))},
+        "dashboardContext": dashboard_context,
+        "nationalReference": national_reference,
+    }
+    if county_name:
+        context["county"] = {
+            "name": county_name,
+            "metrics": _entry_metrics(get_county_entry(abbr, county_name)),
+        }
+    return context
+
+
+_AI_ERROR_ICONS = {
+    "no_api_key": "🔑",
+    "missing_dependency": "🧩",
+    "invalid_key": "🔑",
+    "rate_limited": "⏳",
+    "server_error": "🌐",
+    "network_error": "🌐",
+    "invalid_response": "⚠️",
+    "client_error": "⚠️",
+}
+
+
+def get_active_selection():
+    """Estado/condado activo -- el mismo que usan los dropdowns y el mapa
+    del panel de Dashboards, pero leido desde un espejo en claves propias
+    (active_state_abbr/active_county_name) que SI persiste aunque ese panel
+    este cerrado -- las claves de los widgets (dash_state_name, etc.) se
+    borran de session_state en cuanto sus widgets dejan de dibujarse. Asi el
+    panel fijo de IA (fuera de Dashboards, ver mas abajo) siempre sabe de
+    que estado/condado hablar, sin duplicar la logica de seleccion."""
+    abbr = st.session_state.get("active_state_abbr")
+    if not abbr or abbr not in STATES:
+        return None, None
+    return abbr, st.session_state.get("active_county_name")
+
+
+def render_ai_panel(abbr, county_name):
+    if not abbr:
+        st.info(
+            "Selecciona un estado (buscandolo, o haciendo click en el mapa) para generar un "
+            "analisis con IA."
+        )
+        return
+
+    current_sel = (abbr, county_name)
+    for _key, _default in (
+        ("ai_loading", False),
+        ("ai_pending_selection", None),
+        ("ai_result", None),
+        ("ai_result_selection", None),
+    ):
+        if _key not in st.session_state:
+            st.session_state[_key] = _default
+
+    # Una solicitud que quedo "cargando" para una seleccion que ya no es la
+    # actual (el usuario cambio de estado/condado mientras Gemini
+    # generaba) se abandona: no seguimos esperandola ni la mostramos si
+    # llega a resolverse despues.
+    if st.session_state.ai_loading and st.session_state.ai_pending_selection != current_sel:
+        st.session_state.ai_loading = False
+        st.session_state.ai_pending_selection = None
+
+    entry = get_county_entry(abbr, county_name) if county_name else get_state_entry(abbr)
+    label = county_name or STATES[abbr]["name"]
+
+    if not entry or entry.get("vulnerability") is None:
+        st.caption(f"No hay datos SDOH suficientes de **{label}** para pedirle un analisis a Gemini.")
+        return
+
+    has_result_for_current = (
+        st.session_state.ai_result is not None and st.session_state.ai_result_selection == current_sel
+    )
+
+    col_gen, col_regen = st.columns(2)
+    generate_clicked = col_gen.button(
+        "Generar analisis con IA",
+        key="ai_generate_btn",
+        icon=":material/auto_awesome:",
+        disabled=st.session_state.ai_loading,
+        use_container_width=True,
+    )
+    regenerate_clicked = col_regen.button(
+        "Volver a generar",
+        key="ai_regenerate_btn",
+        icon=":material/refresh:",
+        disabled=st.session_state.ai_loading or not has_result_for_current,
+        use_container_width=True,
+    )
+
+    if (generate_clicked or regenerate_clicked) and not st.session_state.ai_loading:
+        st.session_state.ai_loading = True
+        st.session_state.ai_pending_selection = current_sel
+        st.rerun()
+
+    if st.session_state.ai_loading and st.session_state.ai_pending_selection == current_sel:
+        with st.spinner(f"Gemini esta analizando {label}..."):
+            context = build_ai_context(abbr, county_name)
+            result = gemini_service.generate_analysis(context)
+        # Si mientras corria la llamada el usuario ya cambio de seleccion,
+        # este resultado quedo obsoleto -- no lo guardamos como "actual".
+        if st.session_state.ai_pending_selection == current_sel:
+            st.session_state.ai_result = result
+            st.session_state.ai_result_selection = current_sel
+        st.session_state.ai_loading = False
+        st.rerun()
+
+    result = st.session_state.ai_result
+    result_sel = st.session_state.ai_result_selection
+
+    if result is None:
+        st.caption("Todavia no se genero un analisis para esta seleccion.")
+        return
+
+    if result_sel != current_sel:
+        if result_sel and result_sel[0] in STATES:
+            old_label = STATES[result_sel[0]]["name"] + (f" / {result_sel[1]}" if result_sel[1] else "")
+        else:
+            old_label = "una seleccion anterior"
+        st.info(
+            f"El ultimo analisis generado corresponde a **{old_label}**, no a la seleccion actual. "
+            "Genera uno nuevo para verlo aqui."
+        )
+        return
+
+    if not result.get("ok"):
+        icon = _AI_ERROR_ICONS.get(result.get("code"), "⚠️")
+        st.error(f"{icon} {result.get('message', 'No se pudo generar el analisis.')}")
+        return
+
+    if result.get("truncated"):
+        st.warning(
+            "⚠️ La respuesta se corto antes de terminar las 5 secciones (limite de tokens del "
+            "modelo). Puedes darle a **Volver a generar** para intentar de nuevo."
+        )
+    st.markdown(result["text"])
+    st.caption(
+        f"🤖 Analisis generado con IA (Gemini, modelo `{result.get('model', '?')}`) para **{label}**"
+        + (f", estado **{STATES[abbr]['name']}**" if county_name else "")
+        + " -- basado unicamente en los datos mostrados en este dashboard. Verifica cifras "
+        "criticas antes de usarlas para tomar decisiones."
+    )
+
 
 st.title("Fifty States, One Territory")
 st.caption(
@@ -231,7 +585,7 @@ HTML_TEMPLATE = r"""
   #nation-svg {
     position:absolute; inset:0; width:100%; height:100%; transition:opacity .4s ease;
     background-color:#eef2ef; background-image:__NATION_BG_CSS__;
-    background-size:100% 100%; background-repeat:no-repeat;
+    background-size:contain; background-position:center; background-repeat:no-repeat;
   }
   #state-svg {
     position:absolute; inset:0; width:100%; height:100%; transition:opacity .4s ease;
@@ -296,9 +650,50 @@ window.onerror = function (msg, src, line, col, err) {
   showFatal('JS error: ' + msg + ' (linea ' + line + ')');
 };
 
+// --------------------------------------------------------------------
+// Puente de Streamlit Components, escrito a mano (sin streamlit-component-lib,
+// sin build/npm): esto es lo que permite que un click en un condado dentro
+// de este iframe le devuelva un valor a Python (a diferencia de
+// components.html, que es un srcdoc sin canal de vuelta). El protocolo es
+// solo postMessage con dos tipos de mensaje, en ambas direcciones:
+//   - de aqui hacia Streamlit: streamlit:componentReady, streamlit:setComponentValue
+//   - de Streamlit hacia aqui: streamlit:render (trae los args actuales cada
+//     vez que Python vuelve a llamar al componente)
+const Streamlit = (() => {
+  function post(type, payload) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type }, payload), '*');
+  }
+  return {
+    init: () => post('streamlit:componentReady', { apiVersion: 1 }),
+    sendValue: (value) => post('streamlit:setComponentValue', { value, dataType: 'json' }),
+    onRender: (callback) => {
+      window.addEventListener('message', (event) => {
+        if (event.data && event.data.type === 'streamlit:render') callback(event.data);
+      });
+    },
+  };
+})();
+
 let currentLevel = 'nation';
 let currentState = null;
 let map = null; // el mapa real (MapLibre) se crea recien al entrar a un estado
+
+// Evita que un click viejo (ya procesado del lado de Python) se vuelva a
+// aplicar solo porque el componente se re-renderizo por otra razon: cada
+// click manda un numero que siempre sube (clickSeq). lastAppliedAbbr/County
+// evitan volver a llamar enterState/flyToCity si la vista actual ya es esa
+// (por ejemplo cuando el propio click que mandamos vuelve reflejado en el
+// siguiente streamlit:render).
+let clickSeq = 0;
+let lastAppliedAbbr = null;
+let lastAppliedCounty = null;
+
+function reportCountyClick(abbr, countyName) {
+  lastAppliedAbbr = abbr;
+  lastAppliedCounty = countyName;
+  clickSeq += 1;
+  Streamlit.sendValue({ abbr, county: countyName, seq: clickSeq });
+}
 
 function regionColor(abbr) {
   return REGIONS[STATES[abbr].region].color;
@@ -378,7 +773,10 @@ function buildNationSvg() {
       }
       path.addEventListener('mouseenter', () => highlight(true));
       path.addEventListener('mouseleave', () => highlight(false));
-      path.addEventListener('click', () => enterState(abbr));
+      path.addEventListener('click', () => {
+        enterState(abbr);
+        reportCountyClick(abbr, null);
+      });
       const title = document.createElementNS(SVG_NS, 'title');
       title.textContent = STATES[abbr].name;
       path.appendChild(title);
@@ -535,7 +933,10 @@ function buildStateSvg(abbr) {
     }
     path.addEventListener('mouseenter', () => highlight(true));
     path.addEventListener('mouseleave', () => highlight(false));
-    path.addEventListener('click', () => flyToCity(abbr, c.name, c.center));
+    path.addEventListener('click', () => {
+      flyToCity(abbr, c.name, c.center);
+      reportCountyClick(abbr, c.name);
+    });
 
     const title = document.createElementNS(SVG_NS, 'title');
     title.textContent = c.name + (c.vulnerability != null ? ' — vulnerabilidad ' + c.vulnerability + (band ? ' (' + band.label + ')' : '') : '');
@@ -587,7 +988,10 @@ function showCitiesForState(abbr) {
     const band = vulnBand(c.v);
     const label = band ? c.name + ' — vulnerabilidad ' + c.v + ' (' + band.label + ')' : c.name;
     marker.bindTooltip(label, { direction: 'top', offset: [0, -h_for(c)] });
-    marker.on('click', () => flyToCity(abbr, c.name, [c.lon, c.lat]));
+    marker.on('click', () => {
+      flyToCity(abbr, c.name, [c.lon, c.lat]);
+      reportCountyClick(abbr, c.name);
+    });
     cityCluster.addLayer(marker);
   });
 }
@@ -701,7 +1105,10 @@ document.getElementById('back-btn').addEventListener('click', () => {
 });
 
 ['AK', 'HI', 'PR'].forEach(abbr => {
-  document.getElementById('chip-' + abbr).addEventListener('click', () => enterState(abbr));
+  document.getElementById('chip-' + abbr).addEventListener('click', () => {
+    enterState(abbr);
+    reportCountyClick(abbr, null);
+  });
 });
 
 const searchInput = document.getElementById('search-input');
@@ -713,27 +1120,237 @@ Object.values(STATES).forEach(s => {
 });
 searchInput.addEventListener('change', () => {
   const match = Object.entries(STATES).find(([, v]) => v.name.toLowerCase() === searchInput.value.toLowerCase());
-  if (match) { enterState(match[0]); searchInput.value = ''; searchInput.blur(); }
+  if (match) {
+    enterState(match[0]);
+    reportCountyClick(match[0], null);
+    searchInput.value = '';
+    searchInput.blur();
+  }
 });
+
+// Vista pedida desde el panel de Dashboards (fuera de este iframe): entra
+// directo al estado seleccionado y, si tambien se eligio un condado o
+// municipio, se acerca a el -- igual que si el usuario hubiera hecho click
+// el mismo. A diferencia del viejo mecanismo (una sola vez, al cargar), esto
+// corre en cada streamlit:render, asi que tambien reacciona si el usuario
+// cambia el dropdown de condado despues de que el mapa ya esta abierto.
+function applyRequestedView(abbr, countyName) {
+  if (!abbr || !STATES[abbr]) return;
+  if (abbr === lastAppliedAbbr && countyName === lastAppliedCounty) return;
+  lastAppliedAbbr = abbr;
+  lastAppliedCounty = countyName;
+  enterState(abbr);
+  if (countyName) {
+    const shapeEntry = COUNTY_SHAPES[abbr] &&
+      COUNTY_SHAPES[abbr].counties.find(c => c.name === countyName);
+    if (shapeEntry) {
+      flyToCity(abbr, shapeEntry.name, shapeEntry.center);
+    } else {
+      const place = (CITIES[abbr] || []).find(p => p.name === countyName);
+      if (place) flyToCity(abbr, place.name, [place.lon, place.lat]);
+    }
+  }
+}
+
+Streamlit.onRender((data) => {
+  const args = data.args || {};
+  applyRequestedView(args.initial_abbr || null, args.initial_county || null);
+});
+Streamlit.init();
 </script>
 """
 
-_nation_bg_css = f"url('data:image/png;base64,{NATION_PNG_B64}')" if NATION_PNG_B64 else "none"
+# --------------------------------------------------------------------
+# El mapa como custom component real (declare_component), no como
+# components.html: asi tiene un canal de vuelta hacia Python (via
+# Streamlit.sendValue en el JS de arriba) para que un click en un condado
+# dentro del mapa pueda actualizar el dropdown/graficas del dashboard sin
+# recargar la pagina. El HTML es estatico (STATES/CITIES/COUNTY_SHAPES no
+# cambian durante la sesion) asi que se escribe una sola vez a disco; lo que
+# si cambia entre reruns (initial_abbr/initial_county) se manda como args
+# del componente, que el JS recibe via streamlit:render sin recargar el
+# iframe.
+_MAP_COMPONENT_DIR = Path(__file__).parent / "map_component"
+_MAP_COMPONENT_DIR.mkdir(exist_ok=True)
+_map_component_html_path = _MAP_COMPONENT_DIR / "index.html"
+if not _map_component_html_path.exists():
+    _nation_bg_css = f"url('data:image/png;base64,{NATION_PNG_B64}')" if NATION_PNG_B64 else "none"
+    _map_static_html = (
+        "<!doctype html><html><head><meta charset=\"utf-8\"></head><body>"
+        + HTML_TEMPLATE
+            .replace("__STATES_JSON__", json.dumps(STATES))
+            .replace("__CITIES_JSON__", json.dumps(CITIES))
+            .replace("__REGIONS_JSON__", json.dumps(REGIONS))
+            .replace("__NAME_TO_ABBR_JSON__", json.dumps(NAME_TO_ABBR))
+            .replace("__STATES_GEOJSON__", json.dumps(STATES_GEOJSON))
+            .replace("__COUNTY_SHAPES_JSON__", json.dumps(COUNTY_SHAPES))
+            .replace("__VULN_BANDS_JSON__", json.dumps(VULN_BANDS))
+            .replace("__VULN_NO_DATA_COLOR_JSON__", json.dumps(VULN_NO_DATA_COLOR))
+            .replace("__NATION_BG_CSS__", _nation_bg_css)
+        + "</body></html>"
+    )
+    _map_component_html_path.write_text(_map_static_html, encoding="utf-8")
 
-html = (
-    HTML_TEMPLATE
-    .replace("__STATES_JSON__", json.dumps(STATES))
-    .replace("__CITIES_JSON__", json.dumps(CITIES))
-    .replace("__REGIONS_JSON__", json.dumps(REGIONS))
-    .replace("__NAME_TO_ABBR_JSON__", json.dumps(NAME_TO_ABBR))
-    .replace("__STATES_GEOJSON__", json.dumps(STATES_GEOJSON))
-    .replace("__COUNTY_SHAPES_JSON__", json.dumps(COUNTY_SHAPES))
-    .replace("__VULN_BANDS_JSON__", json.dumps(VULN_BANDS))
-    .replace("__VULN_NO_DATA_COLOR_JSON__", json.dumps(VULN_NO_DATA_COLOR))
-    .replace("__NATION_BG_CSS__", _nation_bg_css)
-)
+_map_component = components.declare_component("map_dashboard", path=str(_MAP_COMPONENT_DIR))
 
-components.html(html, height=730, scrolling=False)
+
+def render_map_component(initial_abbr=None, initial_county=None, key="map_dashboard_widget"):
+    return _map_component(
+        initial_abbr=initial_abbr,
+        initial_county=initial_county,
+        height=730,
+        key=key,
+        default=None,
+    )
+
+
+def process_map_click(map_value):
+    """Reacciona al valor que devuelve el componente del mapa cuando el
+    usuario hace click en un estado/condado (ver reportCountyClick en el
+    JS). Se llama SIEMPRE que se dibuja el mapa -- con Dashboards abierto o
+    cerrado -- para que un click funcione igual sin importar desde que
+    vista se haga (antes solo se procesaba dentro del bloque de
+    Dashboards, asi que un click en la vista por defecto no hacia nada).
+
+    "seq" sube en cada click -- sin compararlo contra el ultimo que ya
+    procesamos, el mismo valor (que Streamlit sigue devolviendo en cada
+    rerun futuro hasta el proximo click) se reaplicaria una y otra vez.
+    """
+    if not map_value or map_value.get("abbr") not in STATES:
+        return
+    if map_value.get("seq") == st.session_state.get("_map_click_seq"):
+        return
+    st.session_state["_map_click_seq"] = map_value.get("seq")
+    st.session_state["_pending_map_click"] = {
+        "abbr": map_value["abbr"],
+        "county": map_value.get("county"),
+    }
+    st.rerun()
+
+
+# --------------------------------------------------------------------
+# Boton "Dashboards": fuera del mapa, debajo del titulo/metricas. Al
+# activarlo aparecen los selectores (estado completo, o estado + condado)
+# y el mapa se parte con las graficas a la izquierda -- sin esto, la
+# pagina se comporta exactamente igual que antes (mapa a todo lo ancho).
+# --------------------------------------------------------------------
+if st.button(
+    "Ocultar dashboards" if st.session_state.show_dashboard else "Dashboards",
+    icon=":material/close:" if st.session_state.show_dashboard else ":material/bar_chart:",
+    key="dashboards_toggle_btn",
+):
+    if st.session_state.show_dashboard:
+        # No lo ocultamos todavia: en este mismo render se pinta con la
+        # clase de "salida" (ver CSS arriba) para que se vea el fade-out, y
+        # recien despues de esa animacion lo quitamos de verdad (mas abajo).
+        st.session_state.dash_closing = True
+        # Streamlit puede acompanar este click con un reporte desactualizado
+        # del dropdown de estado (ej. si "Estado" se cargo por un click en
+        # el mapa y el usuario nunca toco el widget el mismo), lo que lo
+        # hace volver a su default (Alabama) justo al cerrar. Lo reforzamos
+        # aqui, desde el espejo que si sobrevive (active_state_abbr), antes
+        # de que el dropdown se vuelva a crear mas abajo en este mismo run.
+        _mirror_abbr = st.session_state.get("active_state_abbr")
+        if _mirror_abbr in STATES:
+            st.session_state["dash_state_name"] = STATES[_mirror_abbr]["name"]
+            _mirror_county = st.session_state.get("active_county_name")
+            st.session_state["dash_mode"] = "Estado y condado" if _mirror_county else "Estado completo"
+            if _mirror_county:
+                st.session_state[f"dash_county_name_{_mirror_abbr}"] = _mirror_county
+    else:
+        st.session_state.show_dashboard = True
+    # Sin este rerun explicito el boton se dibuja con la etiqueta vieja en
+    # este mismo render (Streamlit ya lo pinto antes de saber que se hizo
+    # click) y queda "atrasado" una pulsacion, aunque el panel de abajo si
+    # cambia al instante -- forzamos a que la etiqueta tambien se actualice ya.
+    st.rerun()
+
+_dash_abbr = None
+_dash_county = None
+
+if st.session_state.show_dashboard and MAP_DATA:
+    _closing = st.session_state.dash_closing
+    with st.container(key="dash_section_open"):
+        # OJO: este contenedor de controles (y el del mapa, mas abajo) NUNCA
+        # deben cambiar de key mientras esten montados -- Streamlit trata un
+        # cambio de key en un ANCESTRO como si el widget de adentro
+        # (dash_state_name, el selectbox de condado, el propio componente
+        # del mapa) fuera uno nuevo, y le borra el valor que tenia. Por eso
+        # la key de este container es fija (a diferencia de dash_charts_key
+        # de mas abajo, que si puede cambiar porque solo tiene graficas, sin
+        # widgets con estado que conservar).
+        with st.container(border=True):
+            st.markdown("**¿Que quieres visualizar?**")
+            _mode = st.radio(
+                "Modo", ["Estado completo", "Estado y condado"],
+                horizontal=True, label_visibility="collapsed", key="dash_mode",
+            )
+            _state_name = st.selectbox(
+                "Estado", sorted(s["name"] for s in STATES.values()), key="dash_state_name",
+            )
+            _dash_abbr = NAME_TO_ABBR[_state_name]
+            if _mode == "Estado y condado":
+                if COUNTY_SHAPES.get(_dash_abbr):
+                    _county_options = sorted(c["name"] for c in COUNTY_SHAPES[_dash_abbr]["counties"])
+                else:
+                    _county_options = sorted(p["name"] for p in CITIES.get(_dash_abbr, []))
+                if _county_options:
+                    _dash_county = st.selectbox(
+                        "Condado / municipio", _county_options, key=f"dash_county_name_{_dash_abbr}",
+                    )
+                else:
+                    st.caption("Sin condados o municipios disponibles para este territorio.")
+
+        # Espejo en claves propias (no las del widget): dash_state_name y
+        # dash_county_name_* son claves DE WIDGET, y Streamlit las borra de
+        # session_state en cuanto ese widget deja de dibujarse (p. ej. al
+        # cerrar Dashboards) -- por eso el panel fijo de IA de mas abajo, que
+        # debe seguir mostrando la ultima seleccion aunque Dashboards este
+        # cerrado, lee estas otras en vez de las del widget directamente
+        # (ver get_active_selection).
+        st.session_state["active_state_abbr"] = _dash_abbr
+        st.session_state["active_county_name"] = _dash_county
+
+        col_dash, col_map = st.columns([1, 1.7], gap="large")
+        with col_dash:
+            if _closing:
+                _charts_key = "dash_charts_closing"
+            else:
+                # Key con el estado/condado elegido: al cambiar la seleccion,
+                # este bloque se vuelve a montar (en vez de solo actualizar
+                # sus valores) y por lo tanto repite la animacion de entrada
+                # -- asi las graficas tambien transicionan al cambiar de
+                # condado.
+                _charts_key = f"dash_charts_sel_{_slug(_dash_abbr)}_{_slug(_dash_county or 'estado')}"
+            with st.container(key=_charts_key):
+                render_dashboard(_dash_abbr, _dash_county)
+        with col_map:
+            # Key fija -- ver el comentario junto al container de controles;
+            # el componente del mapa tambien es un widget con estado (que
+            # condado se clickeo) que no debe perderse al cerrar.
+            _map_value = render_map_component(_dash_abbr, _dash_county)
+            process_map_click(_map_value)
+
+    if st.session_state.dash_closing:
+        # Las graficas se alcanzan a ir con su propio fade (0.16s) -- los
+        # controles y el mapa ya no pueden re-animarse individualmente (ver
+        # comentario arriba), asi que solo hay que esperar esa unica
+        # transicion antes de ocultar todo el bloque.
+        time.sleep(0.18)
+        st.session_state.show_dashboard = False
+        st.session_state.dash_closing = False
+        st.rerun()
+else:
+    process_map_click(render_map_component())
+
+# Panel de IA fijo: vive fuera del bloque de arriba a proposito, para que
+# aparezca siempre (con Dashboards abierto o cerrado) reflejando el estado
+# activo (get_active_selection lee la misma fuente de verdad que usan el
+# mapa y los dropdowns).
+st.divider()
+st.markdown("### 🤖 Analisis con IA (Gemini)")
+_ai_abbr, _ai_county = get_active_selection()
+render_ai_panel(_ai_abbr, _ai_county)
 
 if not NATION_PNG_B64:
     st.warning(
