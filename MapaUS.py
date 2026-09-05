@@ -22,6 +22,7 @@ Instalar dependencias:
 Ejecutar:
     streamlit run MapaUS.py
 """
+import base64
 import json
 from pathlib import Path
 
@@ -37,6 +38,39 @@ REGIONS = {
     "W":    {"label": "West",      "color": "#3f5f92"},
     "TERR": {"label": "Territory", "color": "#7c4f96"},
 }
+
+# Bandas de vulnerabilidad social (SDOH) -- mismos cortes y colores que el
+# mapa nacional por ZCTA5 (build_zcta_vulnerability_map.py) y que el atlas
+# web, para que todo el proyecto use el mismo lenguaje visual.
+VULN_BANDS = [
+    {"key": "low",      "label": "Baja",      "max": 10,        "color": "#0ca30c"},
+    {"key": "moderate", "label": "Moderada",  "max": 15,        "color": "#fab219"},
+    {"key": "high",     "label": "Alta",      "max": 20,        "color": "#ec835a"},
+    {"key": "severe",   "label": "Severa",    "max": float("inf"), "color": "#d03b3b"},
+]
+VULN_NO_DATA_COLOR = "#9aa39c"
+
+
+def vuln_band(v):
+    if v is None:
+        return None
+    for band in VULN_BANDS:
+        if v < band["max"]:
+            return band
+    return VULN_BANDS[-1]
+
+
+# Mapa nacional a resolucion ZCTA5 (33,300 formas en el area continental),
+# coloreado por banda de vulnerabilidad -- generado una vez por
+# build_zcta_vulnerability_map.py a partir del mismo integrated_data_by_state.csv
+# y del contorno oficial cb_2020_us_zcta520_500k (Census Bureau, dominio
+# publico). Se referencia aqui como imagen de fondo, en base64, detras de la
+# capa SVG de contornos de estado (que sigue siendo la que recibe los clicks).
+_nation_png_path = Path(__file__).parent / "nation_vulnerability.png"
+NATION_PNG_B64 = (
+    base64.b64encode(_nation_png_path.read_bytes()).decode("ascii")
+    if _nation_png_path.exists() else ""
+)
 
 # name debe coincidir exactamente con la propiedad "name" del geojson de
 # contornos de estados que se descarga en el navegador (ver JS mas abajo).
@@ -140,11 +174,25 @@ NAME_TO_ABBR = {v["name"]: k for k, v in STATES.items()}
 # en cada carga de la pagina): fuente PublicaMundi/MappingAPI, dominio publico.
 STATES_GEOJSON = json.loads((Path(__file__).parent / "us_states.json").read_text(encoding="utf-8"))
 
+# Contorno real de los condados (uno por estado + D.C.; Puerto Rico usa su
+# propia vista con marcadores), generado una vez por build_county_shapes.py
+# a partir del limite oficial cb_2020_us_county_500k (Census Bureau, dominio
+# publico) y coloreado con el mismo indice de vulnerabilidad de
+# map_data.json. Reemplaza el mapa de calles + pines al entrar a un estado:
+# ahora la vista de estado es un SVG plano igual que la vista de pais, solo
+# que dividido por condado en vez de por estado.
+_county_shapes_path = Path(__file__).parent / "county_shapes.json"
+COUNTY_SHAPES = (
+    json.loads(_county_shapes_path.read_text(encoding="utf-8"))
+    if _county_shapes_path.exists() else {}
+)
+
 st.title("Fifty States, One Territory")
 st.caption(
-    "Mapa plano de los 50 estados: solo divisiones y siglas. Haz click en un estado para "
-    "volar hacia un mapa real con sus ciudades principales, y en una ciudad para bajar a "
-    "nivel de calle. Alaska, Hawai y Puerto Rico tienen accesos rapidos en las esquinas del mapa."
+    "Mapa nacional a resolucion ZCTA5 (codigo postal aproximado, ~33,300 formas), coloreado "
+    "por banda de vulnerabilidad social. Haz click en un estado para ver sus condados, tambien "
+    "coloreados por banda de vulnerabilidad, y en un condado para bajar a un mapa real a nivel "
+    "de calle. Alaska, Hawai y Puerto Rico tienen accesos rapidos en las esquinas del mapa."
 )
 
 if MAP_DATA:
@@ -158,6 +206,7 @@ if MAP_DATA:
 HTML_TEMPLATE = r"""
 <div id="app">
   <svg id="nation-svg" viewBox="0 0 1000 520" preserveAspectRatio="xMidYMid meet"></svg>
+  <svg id="state-svg" class="view-hidden" preserveAspectRatio="xMidYMid meet"></svg>
   <div id="map" class="view-hidden"></div>
   <div id="control-card">
     <input id="search-input" list="place-list" placeholder="Buscar un estado o territorio..." autocomplete="off" />
@@ -179,7 +228,15 @@ HTML_TEMPLATE = r"""
 <style>
   html, body { margin:0; padding:0; height:100%; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
   #app { position:relative; width:100%; height:720px; }
-  #nation-svg { position:absolute; inset:0; width:100%; height:100%; background:#eef2ef; transition:opacity .4s ease; }
+  #nation-svg {
+    position:absolute; inset:0; width:100%; height:100%; transition:opacity .4s ease;
+    background-color:#eef2ef; background-image:__NATION_BG_CSS__;
+    background-size:100% 100%; background-repeat:no-repeat;
+  }
+  #state-svg {
+    position:absolute; inset:0; width:100%; height:100%; transition:opacity .4s ease;
+    background-color:#eef2ef;
+  }
   #map { position:absolute; inset:0; z-index:1; transition:opacity .4s ease; }
   .view-hidden { opacity:0; pointer-events:none; }
   #control-card {
@@ -223,6 +280,9 @@ const CITIES = __CITIES_JSON__;
 const REGIONS = __REGIONS_JSON__;
 const NAME_TO_ABBR = __NAME_TO_ABBR_JSON__;
 const STATES_GEOJSON = __STATES_GEOJSON__;
+const COUNTY_SHAPES = __COUNTY_SHAPES_JSON__;
+const VULN_BANDS = __VULN_BANDS_JSON__;
+const VULN_NO_DATA_COLOR = __VULN_NO_DATA_COLOR_JSON__;
 const US_BOUNDS = [[-125.5, 24.0], [-66.5, 49.8]];
 const TILE_URL = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
 const TILE_ATTRIBUTION = '&copy; OpenStreetMap contributors';
@@ -251,17 +311,28 @@ function regionColor(abbr) {
 // --------------------------------------------------------------------
 const VB_W = 1000, VB_H = 520;
 
-function project([lon, lat]) {
-  const x = (lon - US_BOUNDS[0][0]) / (US_BOUNDS[1][0] - US_BOUNDS[0][0]) * VB_W;
-  const y = (US_BOUNDS[1][1] - lat) / (US_BOUNDS[1][1] - US_BOUNDS[0][1]) * VB_H;
-  return [x, y];
+// Proyeccion lineal lon/lat -> lienzo, parametrizada por limites y tamano de
+// viewBox: la nacional usa US_BOUNDS fijo; cada estado arma la suya con sus
+// propios limites (ver makeProjector / buildStateSvg mas abajo).
+function makeProjector(bounds, vbW, vbH) {
+  const [[lonMin, latMin], [lonMax, latMax]] = bounds;
+  return ([lon, lat]) => [
+    (lon - lonMin) / (lonMax - lonMin) * vbW,
+    (latMax - lat) / (latMax - latMin) * vbH,
+  ];
 }
-function ringToPath(ring) {
-  return ring.map((pt, i) => (i === 0 ? 'M' : 'L') + project(pt).join(',')).join(' ') + ' Z';
+function padBounds([[lonMin, latMin], [lonMax, latMax]], pad) {
+  const lonPad = (lonMax - lonMin) * pad;
+  const latPad = (latMax - latMin) * pad;
+  return [[lonMin - lonPad, latMin - latPad], [lonMax + lonPad, latMax + latPad]];
 }
-function geometryToPathD(geom) {
-  if (geom.type === 'Polygon') return geom.coordinates.map(ringToPath).join(' ');
-  if (geom.type === 'MultiPolygon') return geom.coordinates.map(poly => poly.map(ringToPath).join(' ')).join(' ');
+const project = makeProjector(US_BOUNDS, VB_W, VB_H);
+function ringToPath(ring, proj) {
+  return ring.map((pt, i) => (i === 0 ? 'M' : 'L') + proj(pt).join(',')).join(' ') + ' Z';
+}
+function geometryToPathD(geom, proj) {
+  if (geom.type === 'Polygon') return geom.coordinates.map(r => ringToPath(r, proj)).join(' ');
+  if (geom.type === 'MultiPolygon') return geom.coordinates.map(poly => poly.map(r => ringToPath(r, proj)).join(' ')).join(' ');
   return '';
 }
 
@@ -273,19 +344,15 @@ function buildNationSvg() {
       const abbr = NAME_TO_ABBR[f.properties.name];
       if (!abbr || abbr === 'PR') return;
       const path = document.createElementNS(SVG_NS, 'path');
-      path.setAttribute('d', geometryToPathD(f.geometry));
-      path.setAttribute('fill', regionColor(abbr));
+      path.setAttribute('d', geometryToPathD(f.geometry, project));
+      // El relleno por ZCTA5 ya viene pintado en el fondo (nation_vulnerability.png);
+      // esta forma solo dibuja el borde del estado y recibe los clicks.
+      path.setAttribute('fill', 'rgba(255,255,255,0)');
+      path.setAttribute('pointer-events', 'all');
       path.setAttribute('fill-rule', 'evenodd');
-      path.setAttribute('stroke', '#fbfbf8');
-      path.setAttribute('stroke-width', '1.4');
+      path.setAttribute('stroke', 'rgba(22,35,42,0.55)');
+      path.setAttribute('stroke-width', '1.1');
       path.style.cursor = 'pointer';
-      path.addEventListener('mouseenter', () => path.setAttribute('stroke-width', '2.8'));
-      path.addEventListener('mouseleave', () => path.setAttribute('stroke-width', '1.4'));
-      path.addEventListener('click', () => enterState(abbr));
-      const title = document.createElementNS(SVG_NS, 'title');
-      title.textContent = STATES[abbr].name;
-      path.appendChild(title);
-      svg.appendChild(path);
 
       const [cx, cy] = project(STATES[abbr].center);
       const label = document.createElementNS(SVG_NS, 'text');
@@ -300,7 +367,22 @@ function buildNationSvg() {
       label.setAttribute('stroke', '#fbfbf8');
       label.setAttribute('stroke-width', '3');
       label.style.pointerEvents = 'none';
+      label.style.transition = 'font-size .15s ease';
       label.textContent = abbr;
+
+      function highlight(on) {
+        path.setAttribute('stroke-width', on ? '2.4' : '1.1');
+        path.setAttribute('stroke', on ? 'rgba(22,35,42,0.9)' : 'rgba(22,35,42,0.55)');
+        path.setAttribute('fill', on ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0)');
+        label.setAttribute('font-size', on ? '19' : '13');
+      }
+      path.addEventListener('mouseenter', () => highlight(true));
+      path.addEventListener('mouseleave', () => highlight(false));
+      path.addEventListener('click', () => enterState(abbr));
+      const title = document.createElementNS(SVG_NS, 'title');
+      title.textContent = STATES[abbr].name;
+      path.appendChild(title);
+      svg.appendChild(path);
       svg.appendChild(label);
     });
   } catch (e) {
@@ -350,25 +432,160 @@ function createMap(initialCenter, initialZoom, onReady) {
   }
 }
 
-// Escala de vulnerabilidad social (indice SDOH real, 0-30+): claro = menos
-// vulnerable, oscuro = mas vulnerable -- mismo criterio que el atlas de
-// referencia. Los lugares sin dato (Puerto Rico) usan el color de su region.
-const VULN_LOW = [191, 219, 254];   // #bfdbfe
-const VULN_HIGH = [30, 58, 138];    // #1e3a8a
-function vulnColor(v) {
-  const t = Math.max(0, Math.min(1, v / 30));
-  const rgb = VULN_LOW.map((lo, i) => Math.round(lo + (VULN_HIGH[i] - lo) * t));
-  return 'rgb(' + rgb.join(',') + ')';
+// Bandas de vulnerabilidad social (indice SDOH real) -- mismos cortes y
+// colores que el mapa nacional por ZCTA5 de fondo, para que el pin de un
+// condado y el ZCTA5 que lo rodea se lean con el mismo lenguaje de color.
+// Los lugares sin dato (p. ej. Puerto Rico) usan el color de su region.
+function vulnBand(v) {
+  if (v == null) return null;
+  for (const band of VULN_BANDS) { if (v < band.max) return band; }
+  return VULN_BANDS[VULN_BANDS.length - 1];
 }
 function placeColor(abbr, c) {
-  return c.v != null ? vulnColor(c.v) : regionColor(abbr);
+  const band = vulnBand(c.v);
+  return band ? band.color : regionColor(abbr);
+}
+
+// --------------------------------------------------------------------
+// Vista de estado: mismo mecanismo que el mapa nacional (SVG plano, sin
+// tiles), pero dividido por condado en vez de por estado, y coloreado por
+// banda de vulnerabilidad SDOH en vez de por region. El mapa real
+// (Leaflet) solo se crea cuando el usuario entra a un condado en concreto.
+// --------------------------------------------------------------------
+const builtStateSvg = { abbr: null };
+
+function countyDataFor(abbr, name) {
+  const fromCities = (CITIES[abbr] || []).find(c => c.name === name);
+  if (fromCities) return fromCities;
+  const shapeEntry = COUNTY_SHAPES[abbr] && COUNTY_SHAPES[abbr].counties.find(c => c.name === name);
+  if (shapeEntry) {
+    return {
+      name: shapeEntry.name,
+      population: shapeEntry.population,
+      v: shapeEntry.vulnerability,
+      comps: shapeEntry.components,
+      kind: 'Condado',
+    };
+  }
+  return { name, population: null, v: null };
+}
+
+function stateVulnerability(abbr) {
+  const sd = COUNTY_SHAPES[abbr];
+  if (!sd) return null;
+  let sum = 0, w = 0;
+  sd.counties.forEach(c => {
+    if (c.vulnerability != null && c.population) { sum += c.vulnerability * c.population; w += c.population; }
+  });
+  return w > 0 ? Math.round((sum / w) * 10) / 10 : null;
+}
+
+function shortCountyLabel(name) {
+  return name.replace(/ (County|Parish|Borough|Municipality|Census Area|city)$/, '');
+}
+
+function buildStateSvg(abbr) {
+  const svg = document.getElementById('state-svg');
+  svg.innerHTML = '';
+  const sdata = COUNTY_SHAPES[abbr];
+  if (!sdata) return;
+
+  const bounds = padBounds(sdata.bounds, 0.05);
+  const lonSpan = bounds[1][0] - bounds[0][0];
+  const latSpan = bounds[1][1] - bounds[0][1];
+  const vbW = 1000;
+  const vbH = Math.max(220, Math.round(vbW * (latSpan / lonSpan)));
+  svg.setAttribute('viewBox', '0 0 ' + vbW + ' ' + vbH);
+  const proj = makeProjector(bounds, vbW, vbH);
+
+  sdata.counties.forEach(c => {
+    const band = vulnBand(c.vulnerability);
+    const baseColor = band ? band.color : VULN_NO_DATA_COLOR;
+
+    const path = document.createElementNS(SVG_NS, 'path');
+    path.setAttribute('d', geometryToPathD(c.geometry, proj));
+    path.setAttribute('fill', baseColor);
+    path.setAttribute('fill-opacity', '0.88');
+    path.setAttribute('fill-rule', 'evenodd');
+    path.setAttribute('stroke', 'rgba(22,35,42,0.55)');
+    path.setAttribute('stroke-width', '1');
+    path.style.cursor = 'pointer';
+
+    const [cx, cy] = proj(c.center);
+    const label = document.createElementNS(SVG_NS, 'text');
+    label.setAttribute('x', cx);
+    label.setAttribute('y', cy);
+    label.setAttribute('text-anchor', 'middle');
+    label.setAttribute('dominant-baseline', 'middle');
+    label.setAttribute('font-size', '7.5');
+    label.setAttribute('font-weight', '600');
+    label.setAttribute('fill', '#16232a');
+    label.setAttribute('paint-order', 'stroke');
+    label.setAttribute('stroke', '#fbfbf8');
+    label.setAttribute('stroke-width', '2.2');
+    label.style.pointerEvents = 'none';
+    label.style.transition = 'font-size .15s ease';
+    label.textContent = shortCountyLabel(c.name);
+
+    function highlight(on) {
+      path.setAttribute('stroke-width', on ? '2.2' : '1');
+      path.setAttribute('stroke', on ? 'rgba(22,35,42,0.95)' : 'rgba(22,35,42,0.55)');
+      path.setAttribute('fill-opacity', on ? '1' : '0.88');
+      label.setAttribute('font-size', on ? '12' : '7.5');
+    }
+    path.addEventListener('mouseenter', () => highlight(true));
+    path.addEventListener('mouseleave', () => highlight(false));
+    path.addEventListener('click', () => flyToCity(abbr, c.name, c.center));
+
+    const title = document.createElementNS(SVG_NS, 'title');
+    title.textContent = c.name + (c.vulnerability != null ? ' — vulnerabilidad ' + c.vulnerability + (band ? ' (' + band.label + ')' : '') : '');
+    path.appendChild(title);
+
+    svg.appendChild(path);
+    svg.appendChild(label);
+  });
+}
+
+function showStateSvg(abbr) {
+  document.getElementById('state-svg').classList.remove('view-hidden');
+  document.getElementById('map').classList.add('view-hidden');
+  if (builtStateSvg.abbr !== abbr) {
+    buildStateSvg(abbr);
+    builtStateSvg.abbr = abbr;
+  }
+}
+
+function showStateInfo(abbr) {
+  const s = STATES[abbr];
+  const hasCounties = !!COUNTY_SHAPES[abbr];
+  const stateV = stateVulnerability(abbr);
+  const band = vulnBand(stateV);
+  const rows = [
+    { label: 'Capital', value: s.capital || '—' },
+    { label: 'Poblacion', value: s.population.toLocaleString('en-US') },
+    { label: 'Region', value: REGIONS[s.region].label },
+  ];
+  if (stateV != null) {
+    rows.push({ label: 'Vulnerabilidad (SDOH)', value: stateV + (band ? ' — ' + band.label : '') });
+  }
+  rows.push({
+    label: hasCounties ? 'Condados en el mapa' : 'Lugares en el mapa',
+    value: (hasCounties ? COUNTY_SHAPES[abbr].counties.length : (CITIES[abbr] || []).length).toLocaleString('en-US'),
+  });
+  showInfo(s.name, {
+    status: s.status || (REGIONS[s.region].label + ' state'),
+    tagColor: regionColor(abbr),
+    note: s.note,
+    rows: rows,
+  });
 }
 
 function showCitiesForState(abbr) {
   cityCluster.clearLayers();
   CITIES[abbr].forEach(c => {
     const marker = L.marker([c.lat, c.lon], { icon: pinIcon(placeColor(abbr, c), !!c.capital) });
-    const label = c.v != null ? c.name + ' — vulnerabilidad ' + c.v : c.name;
+    const band = vulnBand(c.v);
+    const label = band ? c.name + ' — vulnerabilidad ' + c.v + ' (' + band.label + ')' : c.name;
     marker.bindTooltip(label, { direction: 'top', offset: [0, -h_for(c)] });
     marker.on('click', () => flyToCity(abbr, c.name, [c.lon, c.lat]));
     cityCluster.addLayer(marker);
@@ -393,62 +610,78 @@ function enterState(abbr) {
   const s = STATES[abbr];
 
   document.getElementById('nation-svg').classList.add('view-hidden');
-  document.getElementById('map').classList.remove('view-hidden');
 
-  function focus(justCreated) {
-    map.invalidateSize();
-    if (!justCreated) map.flyTo([s.center[1], s.center[0]], Math.round(s.zoom), { duration: 1.2 });
-    showCitiesForState(abbr);
-    showInfo(s.name, {
-      status: s.status || (REGIONS[s.region].label + ' state'),
-      tagColor: regionColor(abbr),
-      note: s.note,
-      rows: [
-        { label: 'Capital', value: s.capital || '—' },
-        { label: 'Poblacion', value: s.population.toLocaleString('en-US') },
-        { label: 'Region', value: REGIONS[s.region].label },
-        { label: 'Lugares en el mapa', value: (CITIES[abbr] || []).length.toLocaleString('en-US') },
-      ],
-    });
-    const back = document.getElementById('back-btn');
-    back.style.display = 'inline-block';
-    back.textContent = '← Volver a Estados Unidos';
-    document.getElementById('breadcrumb').textContent = 'Estados Unidos › ' + s.name;
-  }
-
-  if (map) {
-    focus(false);
+  if (COUNTY_SHAPES[abbr]) {
+    // Estado con datos de condado: SVG plano coloreado por vulnerabilidad,
+    // sin tiles ni clustering -- el mapa real solo aparece al entrar a un
+    // condado especifico (flyToCity).
+    document.getElementById('map').classList.add('view-hidden');
+    showStateSvg(abbr);
+    showStateInfo(abbr);
+    finishEnterState(s);
   } else {
-    createMap(s.center, s.zoom, () => focus(true));
+    // Sin datos de condado (Puerto Rico): se mantiene el mapa real con
+    // marcadores por municipio.
+    document.getElementById('state-svg').classList.add('view-hidden');
+    document.getElementById('map').classList.remove('view-hidden');
+    function focus(justCreated) {
+      map.invalidateSize();
+      if (!justCreated) map.flyTo([s.center[1], s.center[0]], Math.round(s.zoom), { duration: 1.2 });
+      showCitiesForState(abbr);
+      showStateInfo(abbr);
+      finishEnterState(s);
+    }
+    if (map) focus(false); else createMap(s.center, s.zoom, () => focus(true));
   }
+}
+
+function finishEnterState(s) {
+  const back = document.getElementById('back-btn');
+  back.style.display = 'inline-block';
+  back.textContent = '← Volver a Estados Unidos';
+  document.getElementById('breadcrumb').textContent = 'Estados Unidos › ' + s.name;
 }
 
 function flyToCity(abbr, cityName, coords) {
   currentLevel = 'city';
-  map.flyTo([coords[1], coords[0]], 13, { duration: 1.4 });
-  const city = CITIES[abbr].find(c => c.name === cityName);
-  const rows = [
-    { label: 'Estado', value: STATES[abbr].name },
-    { label: 'Poblacion', value: city.population.toLocaleString('en-US') },
-  ];
-  if (city.v != null) {
-    rows.push({ label: 'Vulnerabilidad (SDOH)', value: city.v });
-    if (city.comps) {
-      rows.push({ label: 'Pobreza (<150% FPL)', value: city.comps.POV150 + '%' });
-      rows.push({ label: 'Desempleo', value: city.comps.UNEMP + '%' });
-      rows.push({ label: 'Sin banda ancha', value: city.comps.BROAD + '%' });
+  document.getElementById('state-svg').classList.add('view-hidden');
+  document.getElementById('map').classList.remove('view-hidden');
+
+  const city = countyDataFor(abbr, cityName);
+  function focus(justCreated) {
+    map.invalidateSize();
+    if (!justCreated) map.flyTo([coords[1], coords[0]], 13, { duration: 1.4 });
+    if (COUNTY_SHAPES[abbr]) {
+      cityCluster.clearLayers();
+      const marker = L.marker([coords[1], coords[0]], { icon: pinIcon(placeColor(abbr, city), true) });
+      cityCluster.addLayer(marker);
     }
-  } else {
-    rows.push({ label: 'Region', value: REGIONS[STATES[abbr].region].label });
+    const rows = [
+      { label: 'Estado', value: STATES[abbr].name },
+      { label: 'Poblacion', value: city.population != null ? city.population.toLocaleString('en-US') : '—' },
+    ];
+    if (city.v != null) {
+      const band = vulnBand(city.v);
+      rows.push({ label: 'Vulnerabilidad (SDOH)', value: city.v + (band ? ' — ' + band.label : '') });
+      if (city.comps) {
+        rows.push({ label: 'Pobreza (<150% FPL)', value: city.comps.POV150 + '%' });
+        rows.push({ label: 'Desempleo', value: city.comps.UNEMP + '%' });
+        rows.push({ label: 'Sin banda ancha', value: city.comps.BROAD + '%' });
+      }
+    } else {
+      rows.push({ label: 'Region', value: REGIONS[STATES[abbr].region].label });
+    }
+    showInfo(cityName, {
+      status: city.kind || 'Lugar',
+      tagColor: placeColor(abbr, city),
+      rows: rows,
+    });
+    const back = document.getElementById('back-btn');
+    back.textContent = '← Volver a ' + STATES[abbr].name;
+    document.getElementById('breadcrumb').textContent = 'Estados Unidos › ' + STATES[abbr].name + ' › ' + cityName;
   }
-  showInfo(cityName, {
-    status: city.kind || 'Lugar',
-    tagColor: placeColor(abbr, city),
-    rows: rows,
-  });
-  const back = document.getElementById('back-btn');
-  back.textContent = '← Volver a ' + STATES[abbr].name;
-  document.getElementById('breadcrumb').textContent = 'Estados Unidos › ' + STATES[abbr].name + ' › ' + cityName;
+
+  if (map) focus(false); else createMap(coords, 13, () => focus(true));
 }
 
 function goNation() {
@@ -458,6 +691,7 @@ function goNation() {
   document.getElementById('info-panel').style.display = 'none';
   document.getElementById('breadcrumb').textContent = 'Estados Unidos';
   document.getElementById('map').classList.add('view-hidden');
+  document.getElementById('state-svg').classList.add('view-hidden');
   document.getElementById('nation-svg').classList.remove('view-hidden');
 }
 
@@ -484,6 +718,8 @@ searchInput.addEventListener('change', () => {
 </script>
 """
 
+_nation_bg_css = f"url('data:image/png;base64,{NATION_PNG_B64}')" if NATION_PNG_B64 else "none"
+
 html = (
     HTML_TEMPLATE
     .replace("__STATES_JSON__", json.dumps(STATES))
@@ -491,34 +727,49 @@ html = (
     .replace("__REGIONS_JSON__", json.dumps(REGIONS))
     .replace("__NAME_TO_ABBR_JSON__", json.dumps(NAME_TO_ABBR))
     .replace("__STATES_GEOJSON__", json.dumps(STATES_GEOJSON))
+    .replace("__COUNTY_SHAPES_JSON__", json.dumps(COUNTY_SHAPES))
+    .replace("__VULN_BANDS_JSON__", json.dumps(VULN_BANDS))
+    .replace("__VULN_NO_DATA_COLOR_JSON__", json.dumps(VULN_NO_DATA_COLOR))
+    .replace("__NATION_BG_CSS__", _nation_bg_css)
 )
 
 components.html(html, height=730, scrolling=False)
 
+if not NATION_PNG_B64:
+    st.warning(
+        "No se encontro nation_vulnerability.png -- corre "
+        "`python3 build_zcta_vulnerability_map.py` para generarlo."
+    )
+
 legend_html = " &nbsp; ".join(
     f"<span style='display:inline-flex;align-items:center;gap:5px;font-size:12px;color:#666;'>"
-    f"<span style='width:10px;height:10px;border-radius:50%;background:{v['color']};display:inline-block;'></span>"
-    f"{v['label']}</span>"
-    for v in REGIONS.values()
+    f"<span style='width:10px;height:10px;border-radius:3px;background:{b['color']};display:inline-block;'></span>"
+    f"{b['label']}</span>"
+    for b in VULN_BANDS
 )
-st.markdown(legend_html + " &nbsp; (mapa nacional, por region)", unsafe_allow_html=True)
+legend_html += (
+    " &nbsp; <span style='display:inline-flex;align-items:center;gap:5px;font-size:12px;color:#666;'>"
+    f"<span style='width:10px;height:10px;border-radius:3px;background:{VULN_NO_DATA_COLOR};display:inline-block;'></span>"
+    "Sin dato</span>"
+)
+st.markdown(
+    legend_html + " &nbsp; (mapa nacional por ZCTA5, vulnerabilidad social SDOH)",
+    unsafe_allow_html=True,
+)
 
 if MAP_DATA:
     st.markdown(
-        "<div style='display:flex;align-items:center;gap:8px;font-size:12px;color:#666;margin-top:4px;'>"
-        "<span>Pines dentro de un estado, por vulnerabilidad social (SDOH):</span>"
-        "<span>Menor</span>"
-        "<span style='width:120px;height:10px;border-radius:5px;"
-        "background:linear-gradient(to right, rgb(191,219,254), rgb(30,58,138));display:inline-block;'></span>"
-        "<span>Mayor</span>"
-        f"<span>&mdash; media nacional: {MAP_DATA['national']['vulnerability']}</span>"
-        "</div>",
+        f"<div style='font-size:12px;color:#666;margin-top:4px;'>Media nacional: "
+        f"{MAP_DATA['national']['vulnerability']} &mdash; los pines dentro de un estado usan "
+        "las mismas bandas de color.</div>",
         unsafe_allow_html=True,
     )
 
 st.caption(
-    "Poblaciones y vulnerabilidad: calculadas desde integrated_data_by_state.csv "
-    "(33,791 ZCTA5 agregados por condado). Vulnerabilidad = media de 7 medidas SDOH "
-    "ponderadas por poblacion (pobreza, desempleo, sin diploma, sin banda ancha, costo "
-    "de vivienda, hacinamiento, hogares monoparentales)."
+    "Poblaciones y vulnerabilidad: calculadas desde integrated_data_by_state.csv. El mapa "
+    "nacional colorea cada uno de los ~33,300 ZCTA5 del area continental; los pines dentro de "
+    "un estado agregan esos mismos ZCTA5 por condado. Vulnerabilidad = media (ponderada por "
+    "poblacion, cuando se agrega por condado o a nivel nacional) de 7 medidas SDOH: pobreza, "
+    "desempleo, sin diploma, sin banda ancha, costo de vivienda, hacinamiento, hogares "
+    "monoparentales."
 )
