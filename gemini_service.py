@@ -26,7 +26,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash").strip() or "gemini-3.6-flash"
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-lite-latest").strip() or "gemini-flash-lite-latest"
 
 REQUIRED_SECTIONS = [
     "Resumen de la situacion",
@@ -77,11 +77,48 @@ def build_prompt(context):
             "  (e) posibles acciones a nivel ESTATAL que podrian ayudar a resolver los problemas "
             "identificados en el condado."
         )
+    elif level == "comparison":
+        state_names = ", ".join(s.get("name", "?") for s in context.get("states", []))
+        level_instructions = (
+            f'selectionLevel es "comparison": el usuario eligio varios estados para comparar '
+            f"({state_names}). Tu respuesta debe cubrir, dentro de las 5 secciones de abajo, TODO "
+            "lo siguiente:\n"
+            "  (a) un resumen breve de la situacion de CADA estado listado en 'states',\n"
+            "  (b) una comparacion directa entre esos estados usando los indicadores equivalentes "
+            "presentes en el JSON (y contra la referencia nacional si 'nationalReference' esta "
+            "disponible),\n"
+            "  (c) cual(es) estado(s) tienen mayor y cual(es) menor vulnerabilidad, y en que "
+            "indicador puntual se nota mas esa diferencia,\n"
+            "  (d) sugerencias de mejora comparativas -- por ejemplo, en que podria un estado con "
+            "peor indicador fijarse de uno con mejor indicador equivalente, siempre basandote solo "
+            "en los datos del JSON, nunca en informacion externa sobre politicas publicas reales."
+        )
     else:
         level_instructions = (
             'selectionLevel es "state": analiza UNICAMENTE la situacion general de ese estado. '
             "No menciones, elijas ni inventes ningun condado especifico -- no hay uno seleccionado."
         )
+
+    neighbor_instructions = ""
+    if level in ("state", "county") and "contrastesVecinos" in context:
+        pairs = context.get("contrastesVecinos") or []
+        if pairs:
+            neighbor_instructions = (
+                "\nAdemas, al FINAL de la seccion \"Resumen de la situacion\" (como ultimo parrafo "
+                "de esa misma seccion, no como una seccion nueva), menciona explicitamente los "
+                "contrastes geograficos de 'contrastesVecinos': son pares de condados VECINOS "
+                "(comparten borde o estan a pocos km) donde uno cae en banda Alta/Severa de "
+                "vulnerabilidad y el de al lado en banda Baja. Nombralos tal cual aparecen en el "
+                "JSON (condadoVulnerabilidadAlta vs. condadoVulnerabilidadBaja, con sus valores) -- "
+                "no inventes otros pares que no esten en esa lista."
+            )
+        else:
+            neighbor_instructions = (
+                "\nAdemas, al FINAL de la seccion \"Resumen de la situacion\" (como ultimo parrafo de "
+                "esa misma seccion), indica explicitamente que, segun 'contrastesVecinos' (que llego "
+                "vacio), no se detectaron condados vecinos con un contraste fuerte entre banda Alta/"
+                "Severa y banda Baja de vulnerabilidad en los datos disponibles."
+            )
 
     return f"""Eres un analista de datos de salud publica y determinantes sociales de la salud
 (SDOH) para un dashboard interactivo de Estados Unidos. Tu unica fuente de informacion es el
@@ -95,6 +132,7 @@ Contexto de la seleccion activa en el dashboard (JSON):
 
 Instrucciones segun el nivel de seleccion:
 {level_instructions}
+{neighbor_instructions}
 
 Responde en espanol, en Markdown, con EXACTAMENTE estas 5 secciones, en este orden y usando
 esos titulos tal cual como encabezado con "####" (nada de secciones extra, nada de texto antes
@@ -133,17 +171,14 @@ def generate_analysis(context):
 
     prompt = build_prompt(context)
     client = genai.Client(api_key=GEMINI_API_KEY)
-    generation_config = types.GenerateContentConfig(
-        temperature=0.3,
-        max_output_tokens=4096,
-        # Los modelos "thinking" (p. ej. gemini-3.6-flash) gastan una buena
-        # parte de max_output_tokens en razonamiento interno antes de
-        # escribir la respuesta visible -- sin acotar esto, la respuesta se
-        # corta a mitad de camino (finish_reason MAX_TOKENS) porque el
-        # "pensamiento" se come casi todo el presupuesto. Le ponemos un tope
-        # bajo para dejarle espacio de sobra al texto real de las 5 secciones.
-        thinking_config=types.ThinkingConfig(thinking_budget=256),
-    )
+    # OJO: no le pasamos thinking_config -- gemini-flash-lite-latest (el
+    # modelo por defecto) lo rechaza con 400 "invalid argument". Si en algun
+    # momento se configura GEMINI_MODEL a un modelo "thinking" (p. ej.
+    # gemini-3.6-flash), ese SI puede gastar la mayoria de max_output_tokens
+    # en razonamiento interno y cortar la respuesta a mitad de camino -- por
+    # eso mas abajo igual detectamos finish_reason MAX_TOKENS y lo marcamos
+    # como "truncated" en vez de fallar silenciosamente.
+    generation_config = types.GenerateContentConfig(temperature=0.3, max_output_tokens=4096)
 
     # Google reporta seguido "modelo con alta demanda" (503) de forma
     # transitoria -- reintentamos un par de veces antes de rendirnos. Los

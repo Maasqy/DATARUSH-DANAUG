@@ -31,6 +31,8 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+from shapely.geometry import shape as shapely_shape
+from shapely.strtree import STRtree
 
 import gemini_service
 
@@ -285,6 +287,84 @@ def get_county_entry(abbr, county_name):
     return next((c for c in state_entry["counties"] if c["name"] == county_name), None)
 
 
+# Distancia limite (en grados, ~2km) para considerar dos condados "vecinos".
+# Los poligonos vienen del contorno cartografico simplificado (500k) que ya
+# usa el mapa -- por la simplificacion, dos condados que en la realidad
+# comparten borde a veces quedan con un huequito microscopico entre sus
+# poligonos, asi que se usa distancia en vez de exigir que se toquen exacto.
+_NEIGHBOR_DISTANCE_DEG = 0.02
+
+
+@st.cache_data(show_spinner=False)
+def compute_neighbor_contrasts(abbr):
+    """Detecta pares de condados VECINOS (poligonos que se tocan o estan a
+    unos pocos km) dentro de un estado donde uno cae en banda Alta/Severa y
+    el otro en Baja -- para que el analisis de IA pueda mencionar ese tipo
+    de contraste geografico real en vez de inventarlo a partir de un solo
+    numero agregado por estado. Se cachea por estado (la geometria no
+    cambia durante la sesion) porque calcular todos los pares es el unico
+    paso algo pesado de armar el contexto para Gemini.
+
+    Devuelve una lista (posiblemente vacia) de hasta 5 pares, ordenados por
+    la diferencia de vulnerabilidad de mayor a menor.
+    """
+    sdata = COUNTY_SHAPES.get(abbr)
+    if not sdata:
+        return []
+
+    shapes, valid = [], []
+    for c in sdata["counties"]:
+        if c.get("vulnerability") is None:
+            continue
+        try:
+            geom = shapely_shape(c["geometry"])
+        except Exception:
+            continue
+        shapes.append(geom)
+        valid.append(c)
+
+    if len(valid) < 2:
+        return []
+
+    tree = STRtree(shapes)
+    seen_pairs = set()
+    contrasts = []
+
+    for i, geom in enumerate(shapes):
+        c = valid[i]
+        band = vuln_band(c["vulnerability"])
+        if not band or band["key"] not in ("high", "severe"):
+            continue
+        for j in tree.query(geom.buffer(_NEIGHBOR_DISTANCE_DEG)):
+            j = int(j)
+            if j == i:
+                continue
+            other = valid[j]
+            other_band = vuln_band(other["vulnerability"])
+            if not other_band or other_band["key"] != "low":
+                continue
+            if geom.distance(shapes[j]) > _NEIGHBOR_DISTANCE_DEG:
+                continue
+            pair_key = tuple(sorted((c["name"], other["name"])))
+            if pair_key in seen_pairs:
+                continue
+            seen_pairs.add(pair_key)
+            contrasts.append(
+                {
+                    "condadoVulnerabilidadAlta": c["name"],
+                    "vulnerabilidadAlta": c["vulnerability"],
+                    "bandaAlta": band["label"],
+                    "condadoVulnerabilidadBaja": other["name"],
+                    "vulnerabilidadBaja": other["vulnerability"],
+                    "bandaBaja": other_band["label"],
+                    "diferencia": round(c["vulnerability"] - other["vulnerability"], 1),
+                }
+            )
+
+    contrasts.sort(key=lambda x: x["diferencia"], reverse=True)
+    return contrasts[:5]
+
+
 def render_dashboard(abbr, county_name):
     entry = get_county_entry(abbr, county_name) if county_name else get_state_entry(abbr)
     label = county_name or STATES[abbr]["name"]
@@ -339,6 +419,51 @@ def render_dashboard(abbr, county_name):
             c1.metric("Minoria racial/etnica", f"{ctx['REMNRTY']}%")
         if ctx.get("AGE65") is not None:
             c2.metric("65 anios o mas", f"{ctx['AGE65']}%")
+
+
+def render_comparison_dashboard(abbrs):
+    """Graficas de comparacion para el modo "Comparar estados": una fila
+    por estado elegido, mismos indicadores que usa render_dashboard pero
+    uno al lado del otro en vez de contra la media nacional."""
+    if len(abbrs) < 2:
+        st.info("Elige 2 o mas estados en el selector de arriba para compararlos.")
+        return
+
+    rows = []
+    comp_series = {}
+    for abbr in abbrs:
+        entry = get_state_entry(abbr)
+        if not entry or entry.get("vulnerability") is None:
+            continue
+        band = vuln_band(entry["vulnerability"])
+        name = STATES[abbr]["name"]
+        rows.append(
+            {
+                "Estado": name,
+                "Vulnerabilidad SDOH": entry["vulnerability"],
+                "Banda": band["label"] if band else "-",
+                "Poblacion": int(entry["population"]) if entry.get("population") else None,
+            }
+        )
+        comp = entry.get("components") or {}
+        comp_series[name] = [comp.get(k) for k in COMPONENT_LABELS]
+
+    if not rows:
+        st.info("No hay datos SDOH suficientes para ninguno de los estados elegidos.")
+        return
+
+    st.markdown(f"#### Comparando {len(rows)} estados")
+    st.caption("Comparar estados")
+
+    df = pd.DataFrame(rows).set_index("Estado")
+    st.caption("Vulnerabilidad SDOH por estado")
+    st.bar_chart(df[["Vulnerabilidad SDOH"]], horizontal=True, height=max(120, 60 * len(rows)))
+    st.dataframe(df, use_container_width=True)
+
+    if len(comp_series) >= 2:
+        df_comp = pd.DataFrame(comp_series, index=list(COMPONENT_LABELS.values()))
+        st.caption("Componentes de vulnerabilidad social (%) por estado")
+        st.bar_chart(df_comp, horizontal=True, height=280)
 
 
 # --------------------------------------------------------------------
@@ -399,6 +524,12 @@ def build_ai_context(abbr, county_name):
         "state": {"name": STATES[abbr]["name"], "metrics": _entry_metrics(get_state_entry(abbr))},
         "dashboardContext": dashboard_context,
         "nationalReference": national_reference,
+        # Pares de condados VECINOS (geometria real, no solo el numero
+        # agregado del estado) donde uno cae en banda Alta/Severa y el de
+        # al lado en Baja -- calculado en Python (compute_neighbor_contrasts)
+        # para que Gemini lo reporte tal cual en vez de inventar geografia.
+        # Lista vacia = no se detecto ningun contraste fuerte entre vecinos.
+        "contrastesVecinos": compute_neighbor_contrasts(abbr),
     }
     if county_name:
         context["county"] = {
@@ -406,6 +537,39 @@ def build_ai_context(abbr, county_name):
             "metrics": _entry_metrics(get_county_entry(abbr, county_name)),
         }
     return context
+
+
+def build_ai_comparison_context(abbrs):
+    """Igual que build_ai_context, pero para el modo "Comparar estados":
+    una lista de estados en vez de un solo estado/condado. Tampoco manda el
+    dataset completo -- solo los indicadores ya agregados por estado."""
+    nat = MAP_DATA["national"] if MAP_DATA else None
+    national_reference = (
+        {
+            "vulnerabilidadSDOH": nat["vulnerability"],
+            "componentesSDOH_pct": {COMPONENT_LABELS[k]: nat["components"].get(k) for k in COMPONENT_LABELS},
+        }
+        if nat else None
+    )
+    return {
+        "selectionLevel": "comparison",
+        "states": [
+            {"name": STATES[abbr]["name"], "metrics": _entry_metrics(get_state_entry(abbr))}
+            for abbr in abbrs
+        ],
+        "dashboardContext": {
+            "dateRange": (
+                "Snapshot mas reciente disponible en el proyecto (CDC PLACES + AHRQ SDOH); "
+                "no hay serie temporal ni rango de fechas."
+            ),
+            "activeFilters": {
+                "modo": "Comparar estados",
+                "estados": [STATES[abbr]["name"] for abbr in abbrs],
+            },
+            "dataSource": "integrated_data_by_state.csv (CDC PLACES + AHRQ SDOH, agregado por estado)",
+        },
+        "nationalReference": national_reference,
+    }
 
 
 _AI_ERROR_ICONS = {
@@ -538,6 +702,110 @@ def render_ai_panel(abbr, county_name):
         + (f", estado **{STATES[abbr]['name']}**" if county_name else "")
         + " -- basado unicamente en los datos mostrados en este dashboard. Verifica cifras "
         "criticas antes de usarlas para tomar decisiones."
+    )
+
+
+def render_ai_comparison_panel(abbrs):
+    """Version de render_ai_panel para el modo "Comparar estados" -- usa su
+    propio set de claves de session_state (ai_compare_*) para no pisar ni
+    mezclarse con el analisis de un solo estado/condado."""
+    if len(abbrs) < 2:
+        st.info("Elige 2 o mas estados en el selector de arriba para pedirle a Gemini que los compare.")
+        return
+
+    current_sel = tuple(sorted(abbrs))
+    for _key, _default in (
+        ("ai_compare_loading", False),
+        ("ai_compare_pending_selection", None),
+        ("ai_compare_result", None),
+        ("ai_compare_result_selection", None),
+    ):
+        if _key not in st.session_state:
+            st.session_state[_key] = _default
+
+    if st.session_state.ai_compare_loading and st.session_state.ai_compare_pending_selection != current_sel:
+        st.session_state.ai_compare_loading = False
+        st.session_state.ai_compare_pending_selection = None
+
+    valid_abbrs = [a for a in abbrs if (get_state_entry(a) or {}).get("vulnerability") is not None]
+    label = " vs. ".join(STATES[a]["name"] for a in abbrs)
+
+    if not valid_abbrs or len(valid_abbrs) < 2:
+        st.caption(
+            f"No hay datos SDOH suficientes para al menos dos de los estados elegidos "
+            f"({label}) -- no se le puede pedir una comparacion a Gemini."
+        )
+        return
+
+    has_result_for_current = (
+        st.session_state.ai_compare_result is not None
+        and st.session_state.ai_compare_result_selection == current_sel
+    )
+
+    col_gen, col_regen = st.columns(2)
+    generate_clicked = col_gen.button(
+        "Generar analisis comparativo con IA",
+        key="ai_compare_generate_btn",
+        icon=":material/auto_awesome:",
+        disabled=st.session_state.ai_compare_loading,
+        use_container_width=True,
+    )
+    regenerate_clicked = col_regen.button(
+        "Volver a generar",
+        key="ai_compare_regenerate_btn",
+        icon=":material/refresh:",
+        disabled=st.session_state.ai_compare_loading or not has_result_for_current,
+        use_container_width=True,
+    )
+
+    if (generate_clicked or regenerate_clicked) and not st.session_state.ai_compare_loading:
+        st.session_state.ai_compare_loading = True
+        st.session_state.ai_compare_pending_selection = current_sel
+        st.rerun()
+
+    if st.session_state.ai_compare_loading and st.session_state.ai_compare_pending_selection == current_sel:
+        with st.spinner(f"Gemini esta comparando {label}..."):
+            context = build_ai_comparison_context(abbrs)
+            result = gemini_service.generate_analysis(context)
+        if st.session_state.ai_compare_pending_selection == current_sel:
+            st.session_state.ai_compare_result = result
+            st.session_state.ai_compare_result_selection = current_sel
+        st.session_state.ai_compare_loading = False
+        st.rerun()
+
+    result = st.session_state.ai_compare_result
+    result_sel = st.session_state.ai_compare_result_selection
+
+    if result is None:
+        st.caption("Todavia no se genero un analisis comparativo para esta seleccion.")
+        return
+
+    if result_sel != current_sel:
+        old_label = (
+            " vs. ".join(STATES[a]["name"] for a in result_sel if a in STATES)
+            if result_sel else "una seleccion anterior"
+        )
+        st.info(
+            f"El ultimo analisis comparativo corresponde a **{old_label}**, no a la seleccion "
+            "actual. Genera uno nuevo para verlo aqui."
+        )
+        return
+
+    if not result.get("ok"):
+        icon = _AI_ERROR_ICONS.get(result.get("code"), "⚠️")
+        st.error(f"{icon} {result.get('message', 'No se pudo generar el analisis.')}")
+        return
+
+    if result.get("truncated"):
+        st.warning(
+            "⚠️ La respuesta se corto antes de terminar las 5 secciones (limite de tokens del "
+            "modelo). Puedes darle a **Volver a generar** para intentar de nuevo."
+        )
+    st.markdown(result["text"])
+    st.caption(
+        f"🤖 Analisis comparativo generado con IA (Gemini, modelo `{result.get('model', '?')}`) "
+        f"para **{label}** -- basado unicamente en los datos mostrados en este dashboard. "
+        "Verifica cifras criticas antes de usarlas para tomar decisiones."
     )
 
 
@@ -1282,24 +1550,33 @@ if st.session_state.show_dashboard and MAP_DATA:
         with st.container(border=True):
             st.markdown("**¿Que quieres visualizar?**")
             _mode = st.radio(
-                "Modo", ["Estado completo", "Estado y condado"],
+                "Modo", ["Estado completo", "Estado y condado", "Comparar estados"],
                 horizontal=True, label_visibility="collapsed", key="dash_mode",
             )
-            _state_name = st.selectbox(
-                "Estado", sorted(s["name"] for s in STATES.values()), key="dash_state_name",
-            )
-            _dash_abbr = NAME_TO_ABBR[_state_name]
-            if _mode == "Estado y condado":
-                if COUNTY_SHAPES.get(_dash_abbr):
-                    _county_options = sorted(c["name"] for c in COUNTY_SHAPES[_dash_abbr]["counties"])
-                else:
-                    _county_options = sorted(p["name"] for p in CITIES.get(_dash_abbr, []))
-                if _county_options:
-                    _dash_county = st.selectbox(
-                        "Condado / municipio", _county_options, key=f"dash_county_name_{_dash_abbr}",
-                    )
-                else:
-                    st.caption("Sin condados o municipios disponibles para este territorio.")
+            _compare_abbrs = []
+            if _mode == "Comparar estados":
+                _compare_names = st.multiselect(
+                    "Estados a comparar (elige 2 o mas)",
+                    sorted(s["name"] for s in STATES.values()),
+                    key="dash_compare_states",
+                )
+                _compare_abbrs = [NAME_TO_ABBR[n] for n in _compare_names]
+            else:
+                _state_name = st.selectbox(
+                    "Estado", sorted(s["name"] for s in STATES.values()), key="dash_state_name",
+                )
+                _dash_abbr = NAME_TO_ABBR[_state_name]
+                if _mode == "Estado y condado":
+                    if COUNTY_SHAPES.get(_dash_abbr):
+                        _county_options = sorted(c["name"] for c in COUNTY_SHAPES[_dash_abbr]["counties"])
+                    else:
+                        _county_options = sorted(p["name"] for p in CITIES.get(_dash_abbr, []))
+                    if _county_options:
+                        _dash_county = st.selectbox(
+                            "Condado / municipio", _county_options, key=f"dash_county_name_{_dash_abbr}",
+                        )
+                    else:
+                        st.caption("Sin condados o municipios disponibles para este territorio.")
 
         # Espejo en claves propias (no las del widget): dash_state_name y
         # dash_county_name_* son claves DE WIDGET, y Streamlit las borra de
@@ -1308,27 +1585,45 @@ if st.session_state.show_dashboard and MAP_DATA:
         # debe seguir mostrando la ultima seleccion aunque Dashboards este
         # cerrado, lee estas otras en vez de las del widget directamente
         # (ver get_active_selection).
-        st.session_state["active_state_abbr"] = _dash_abbr
-        st.session_state["active_county_name"] = _dash_county
+        if _mode == "Comparar estados":
+            st.session_state["active_mode"] = "comparison"
+            st.session_state["active_compare_states"] = _compare_abbrs
+        else:
+            st.session_state["active_mode"] = "single"
+            st.session_state["active_state_abbr"] = _dash_abbr
+            st.session_state["active_county_name"] = _dash_county
 
         col_dash, col_map = st.columns([1, 1.7], gap="large")
         with col_dash:
-            if _closing:
-                _charts_key = "dash_charts_closing"
+            if _mode == "Comparar estados":
+                _charts_key = (
+                    "dash_compare_charts_closing" if _closing
+                    else f"dash_compare_charts_{_slug('-'.join(sorted(_compare_abbrs)) or 'ninguno')}"
+                )
+                with st.container(key=_charts_key):
+                    render_comparison_dashboard(_compare_abbrs)
             else:
-                # Key con el estado/condado elegido: al cambiar la seleccion,
-                # este bloque se vuelve a montar (en vez de solo actualizar
-                # sus valores) y por lo tanto repite la animacion de entrada
-                # -- asi las graficas tambien transicionan al cambiar de
-                # condado.
-                _charts_key = f"dash_charts_sel_{_slug(_dash_abbr)}_{_slug(_dash_county or 'estado')}"
-            with st.container(key=_charts_key):
-                render_dashboard(_dash_abbr, _dash_county)
+                if _closing:
+                    _charts_key = "dash_charts_closing"
+                else:
+                    # Key con el estado/condado elegido: al cambiar la
+                    # seleccion, este bloque se vuelve a montar (en vez de
+                    # solo actualizar sus valores) y por lo tanto repite la
+                    # animacion de entrada -- asi las graficas tambien
+                    # transicionan al cambiar de condado.
+                    _charts_key = f"dash_charts_sel_{_slug(_dash_abbr)}_{_slug(_dash_county or 'estado')}"
+                with st.container(key=_charts_key):
+                    render_dashboard(_dash_abbr, _dash_county)
         with col_map:
             # Key fija -- ver el comentario junto al container de controles;
             # el componente del mapa tambien es un widget con estado (que
-            # condado se clickeo) que no debe perderse al cerrar.
-            _map_value = render_map_component(_dash_abbr, _dash_county)
+            # condado se clickeo) que no debe perderse al cerrar. En modo
+            # comparacion no hay un solo estado "activo" para el mapa, asi
+            # que se muestra la vista nacional.
+            if _mode == "Comparar estados":
+                _map_value = render_map_component(None, None)
+            else:
+                _map_value = render_map_component(_dash_abbr, _dash_county)
             process_map_click(_map_value)
 
     if st.session_state.dash_closing:
@@ -1343,15 +1638,9 @@ if st.session_state.show_dashboard and MAP_DATA:
 else:
     process_map_click(render_map_component())
 
-# Panel de IA fijo: vive fuera del bloque de arriba a proposito, para que
-# aparezca siempre (con Dashboards abierto o cerrado) reflejando el estado
-# activo (get_active_selection lee la misma fuente de verdad que usan el
-# mapa y los dropdowns).
-st.divider()
-st.markdown("### 🤖 Analisis con IA (Gemini)")
-_ai_abbr, _ai_county = get_active_selection()
-render_ai_panel(_ai_abbr, _ai_county)
-
+# La leyenda va pegada al mapa a proposito (antes vivia mas abajo, pero el
+# panel de IA -- que puede crecer bastante con la respuesta -- la terminaba
+# empujando hasta el fondo de la pagina).
 if not NATION_PNG_B64:
     st.warning(
         "No se encontro nation_vulnerability.png -- corre "
@@ -1381,6 +1670,40 @@ if MAP_DATA:
         "las mismas bandas de color.</div>",
         unsafe_allow_html=True,
     )
+
+# --------------------------------------------------------------------
+# Panel de IA fijo: vive fuera del bloque de arriba a proposito, para que
+# aparezca siempre (con Dashboards abierto o cerrado) reflejando el estado
+# activo. Tiene su propio boton para ocultar/mostrar el contenido (queda
+# solo el titulo + boton, sin el ruido visual del analisis/botones/errores)
+# -- get_active_selection y active_mode leen la misma fuente de verdad que
+# usan el mapa y los dropdowns.
+# --------------------------------------------------------------------
+if "ai_panel_visible" not in st.session_state:
+    st.session_state.ai_panel_visible = True
+
+st.divider()
+_col_ai_title, _col_ai_toggle = st.columns([5, 1.6])
+with _col_ai_title:
+    st.markdown("### 🤖 Analisis con IA (Gemini)")
+with _col_ai_toggle:
+    if st.button(
+        "Ocultar" if st.session_state.ai_panel_visible else "Mostrar",
+        key="ai_panel_visibility_btn",
+        icon=":material/visibility_off:" if st.session_state.ai_panel_visible else ":material/visibility:",
+        use_container_width=True,
+    ):
+        st.session_state.ai_panel_visible = not st.session_state.ai_panel_visible
+        # Mismo motivo que el boton de Dashboards: sin este rerun la
+        # etiqueta queda un click atrasada.
+        st.rerun()
+
+if st.session_state.ai_panel_visible:
+    if st.session_state.get("active_mode") == "comparison":
+        render_ai_comparison_panel(st.session_state.get("active_compare_states") or [])
+    else:
+        _ai_abbr, _ai_county = get_active_selection()
+        render_ai_panel(_ai_abbr, _ai_county)
 
 st.caption(
     "Poblaciones y vulnerabilidad: calculadas desde integrated_data_by_state.csv. El mapa "
