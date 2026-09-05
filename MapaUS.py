@@ -852,28 +852,59 @@ HTML_TEMPLATE = r"""
   #app { position:relative; width:100%; height:720px; }
   #nation-svg {
     position:absolute; inset:0; width:100%; height:100%;
-    transition:opacity .45s ease, transform .45s ease;
     transform-origin:center center; transform:scale(1);
     background-color:#eef2ef; background-image:__NATION_BG_CSS__;
     background-size:contain; background-position:center; background-repeat:no-repeat;
   }
   #state-svg {
     position:absolute; inset:0; width:100%; height:100%;
-    transition:opacity .45s ease, transform .45s ease;
     transform-origin:center center; transform:scale(1);
     background-color:#eef2ef;
   }
   #map { position:absolute; inset:0; z-index:1; transition:opacity .4s ease; }
-  .view-hidden { opacity:0; pointer-events:none; }
-  /* El "zoom hacia/desde el centro" solo aplica a las dos vistas SVG (pais
-     y estado) -- el mapa real (#map, Leaflet) se queda solo con el fade de
-     .view-hidden de arriba, porque escalarlo con CSS mientras esta oculto
-     desincroniza el tamano que Leaflet cree que tiene (invalidateSize ya se
-     encarga de acomodarlo, pero no espera un transform por fuera suyo). Al
-     entrar a un estado, nation-svg se encoge hacia su centro (sale) y
-     state-svg crece desde ese mismo centro (entra) -- y al reves al volver.
+  .view-hidden { opacity:0; pointer-events:none; transform:scale(0); }
+  /* Animacion de zoom (pais <-> estado), a proposito NO es una simple
+     transicion CSS por opacidad+transform en paralelo -- eso se sentia muy
+     diluido (los dos SVG cambiando encimados al mismo tiempo). Esto son dos
+     animaciones con nombre y en SECUENCIA real (la de salida termina antes
+     de que arranque la de entrada -- ver zoomSwap() en el JS). Tiene
+     direccion: "forward" (pais -> estado, se siente como avanzar/acercarse:
+     lo que se va CRECE y se desvanece, como si pasaramos a traves; lo nuevo
+     APARECE CHICO y crece hacia nosotros) y "backward" (estado -> pais, el
+     regreso: lo que se va se ENCOGE y se desvanece -- se aleja; lo nuevo
+     aparece GRANDE y se encoge a su tamano normal -- como si nos alejaramos
+     de donde estabamos). Solo se aplica a las dos vistas SVG (pais/estado)
+     -- el mapa real (#map, Leaflet) sigue solo con el fade de arriba, para
+     no desincronizar el tamano que Leaflet cree que tiene.
   */
-  #nation-svg.view-hidden, #state-svg.view-hidden { transform:scale(0); }
+  @keyframes mapPushOut {
+    from { opacity:1; transform:scale(1); }
+    to   { opacity:0; transform:scale(2.4); }
+  }
+  @keyframes mapPushIn {
+    from { opacity:0; transform:scale(.25); }
+    to   { opacity:1; transform:scale(1); }
+  }
+  @keyframes mapPullOut {
+    from { opacity:1; transform:scale(1); }
+    to   { opacity:0; transform:scale(.25); }
+  }
+  @keyframes mapPullIn {
+    from { opacity:0; transform:scale(2.4); }
+    to   { opacity:1; transform:scale(1); }
+  }
+  #nation-svg.zoom-fwd-out, #state-svg.zoom-fwd-out {
+    animation:mapPushOut .38s cubic-bezier(.55,0,.85,.35) forwards;
+  }
+  #nation-svg.zoom-fwd-in, #state-svg.zoom-fwd-in {
+    animation:mapPushIn .38s cubic-bezier(.15,.65,.45,1) forwards;
+  }
+  #nation-svg.zoom-back-out, #state-svg.zoom-back-out {
+    animation:mapPullOut .38s cubic-bezier(.55,0,.85,.35) forwards;
+  }
+  #nation-svg.zoom-back-in, #state-svg.zoom-back-in {
+    animation:mapPullIn .38s cubic-bezier(.15,.65,.45,1) forwards;
+  }
   #control-card {
     position:absolute; top:14px; left:14px; z-index:5;
     background:rgba(255,255,255,.96); border-radius:10px; padding:10px 12px;
@@ -958,6 +989,7 @@ const Streamlit = (() => {
 let currentLevel = 'nation';
 let currentState = null;
 let map = null; // el mapa real (MapLibre) se crea recien al entrar a un estado
+let lastZoomOrigin = '50% 50%'; // punto (transform-origin) del ultimo zoom pais<->estado, para que la salida revierta por el mismo punto de entrada
 
 // Evita que un click viejo (ya procesado del lado de Python) se vuelva a
 // aplicar solo porque el componente se re-renderizo por otra razon: cada
@@ -1126,6 +1158,67 @@ function placeColor(abbr, c) {
 }
 
 // --------------------------------------------------------------------
+// Animacion de zoom pais <-> estado: dos animaciones con nombre EN
+// SECUENCIA (no una transicion CSS por opacidad+transform corriendo en
+// paralelo en los dos SVG a la vez -- eso se sentia muy diluido). Primero
+// el que se ve termina su animacion de salida, y RECIEN CUANDO ESO TERMINA
+// arranca el nuevo con su animacion de entrada. direction="forward" (entrar
+// a un estado) hace que lo viejo CREZCA y se desvanezca (como si pasaramos
+// a traves de el, avanzando) y lo nuevo APAREZCA CHICO y crezca hacia
+// nosotros. direction="backward" (volver al pais) es lo opuesto: lo viejo
+// se ENCOGE y se desvanece (se aleja) y lo nuevo aparece GRANDE y se encoge
+// a su tamano normal. Los nombres de las clases atan a los @keyframes de
+// mas arriba.
+// --------------------------------------------------------------------
+// Punto (en % del viewBox del SVG nacional) donde esta el centro de un
+// estado -- el mismo punto se usa como transform-origin al entrar (el pais
+// se "hunde" hacia ahi y el estado nace ahi) y al salir (el estado se
+// encoge hacia ese mismo punto y el pais crece desde ahi), para que la
+// animacion apunte al estado en cuestion en vez de siempre al centro fijo
+// del mapa.
+function stateOriginPercent(abbr) {
+  const [cx, cy] = project(STATES[abbr].center);
+  const x = Math.min(100, Math.max(0, (cx / VB_W) * 100));
+  const y = Math.min(100, Math.max(0, (cy / VB_H) * 100));
+  return x.toFixed(2) + '% ' + y.toFixed(2) + '%';
+}
+
+function zoomSwap(hideEl, showEl, direction, origin) {
+  const outClass = direction === 'backward' ? 'zoom-back-out' : 'zoom-fwd-out';
+  const inClass = direction === 'backward' ? 'zoom-back-in' : 'zoom-fwd-in';
+  const ALL_ZOOM_CLASSES = ['zoom-fwd-out', 'zoom-fwd-in', 'zoom-back-out', 'zoom-back-in'];
+
+  // Si habia una animacion a medias (el usuario clickeo dos veces muy
+  // rapido), la cortamos limpio antes de arrancar la nueva en vez de
+  // dejarla colgada o pisarse entre si.
+  [hideEl, showEl].forEach(el => el.classList.remove(...ALL_ZOOM_CLASSES));
+  if (origin) {
+    hideEl.style.transformOrigin = origin;
+    showEl.style.transformOrigin = origin;
+  }
+
+  hideEl.classList.remove('view-hidden');
+  void hideEl.offsetWidth; // fuerza un reflow: sin esto el navegador a veces no nota que hay que reiniciar la animacion
+  hideEl.classList.add(outClass);
+
+  const finishOut = () => {
+    hideEl.removeEventListener('animationend', finishOut);
+    hideEl.classList.remove(outClass);
+    hideEl.classList.add('view-hidden');
+
+    showEl.classList.remove('view-hidden');
+    void showEl.offsetWidth;
+    showEl.classList.add(inClass);
+    const finishIn = () => {
+      showEl.removeEventListener('animationend', finishIn);
+      showEl.classList.remove(inClass);
+    };
+    showEl.addEventListener('animationend', finishIn);
+  };
+  hideEl.addEventListener('animationend', finishOut);
+}
+
+// --------------------------------------------------------------------
 // Vista de estado: mismo mecanismo que el mapa nacional (SVG plano, sin
 // tiles), pero dividido por condado en vez de por estado, y coloreado por
 // banda de vulnerabilidad SDOH en vez de por region. El mapa real
@@ -1228,15 +1321,6 @@ function buildStateSvg(abbr) {
   });
 }
 
-function showStateSvg(abbr) {
-  document.getElementById('state-svg').classList.remove('view-hidden');
-  document.getElementById('map').classList.add('view-hidden');
-  if (builtStateSvg.abbr !== abbr) {
-    buildStateSvg(abbr);
-    builtStateSvg.abbr = abbr;
-  }
-}
-
 function showStateInfo(abbr) {
   const s = STATES[abbr];
   const hasCounties = !!COUNTY_SHAPES[abbr];
@@ -1294,19 +1378,36 @@ function enterState(abbr) {
   currentState = abbr;
   const s = STATES[abbr];
 
-  document.getElementById('nation-svg').classList.add('view-hidden');
-
   if (COUNTY_SHAPES[abbr]) {
     // Estado con datos de condado: SVG plano coloreado por vulnerabilidad,
     // sin tiles ni clustering -- el mapa real solo aparece al entrar a un
     // condado especifico (flyToCity).
     document.getElementById('map').classList.add('view-hidden');
-    showStateSvg(abbr);
+    if (builtStateSvg.abbr !== abbr) {
+      buildStateSvg(abbr);
+      builtStateSvg.abbr = abbr;
+    }
+    const nationEl = document.getElementById('nation-svg');
+    const stateEl = document.getElementById('state-svg');
+    if (!nationEl.classList.contains('view-hidden')) {
+      // Veniamos del mapa completo -- esta es la animacion de zoom pedida:
+      // el pais se hunde hacia donde esta el estado clickeado y, cuando
+      // termina, el estado crece desde ese mismo punto.
+      lastZoomOrigin = stateOriginPercent(abbr);
+      zoomSwap(nationEl, stateEl, 'forward', lastZoomOrigin);
+    } else {
+      // Ya estabamos viendo otro estado (p. ej. se cambio de estado por el
+      // dropdown de Dashboards sin volver antes al mapa completo) -- no
+      // hay "mapa completo" del que salir, asi que el cambio es directo.
+      nationEl.classList.add('view-hidden');
+      stateEl.classList.remove('view-hidden');
+    }
     showStateInfo(abbr);
     finishEnterState(s);
   } else {
     // Sin datos de condado (Puerto Rico): se mantiene el mapa real con
     // marcadores por municipio.
+    document.getElementById('nation-svg').classList.add('view-hidden');
     document.getElementById('state-svg').classList.add('view-hidden');
     document.getElementById('map').classList.remove('view-hidden');
     function focus(justCreated) {
@@ -1375,9 +1476,20 @@ function goNation() {
   document.getElementById('back-btn').style.display = 'none';
   document.getElementById('info-panel').style.display = 'none';
   document.getElementById('breadcrumb').textContent = 'Estados Unidos';
+
+  const nationEl = document.getElementById('nation-svg');
+  const stateEl = document.getElementById('state-svg');
   document.getElementById('map').classList.add('view-hidden');
-  document.getElementById('state-svg').classList.add('view-hidden');
-  document.getElementById('nation-svg').classList.remove('view-hidden');
+
+  if (!stateEl.classList.contains('view-hidden')) {
+    // Misma animacion de zoom, ahora al reves: el estado se encoge hacia el
+    // mismo punto por el que se entro (lastZoomOrigin) y el pais completo
+    // crece desde ahi de vuelta a su tamano normal.
+    zoomSwap(stateEl, nationEl, 'backward', lastZoomOrigin);
+  } else {
+    stateEl.classList.add('view-hidden');
+    nationEl.classList.remove('view-hidden');
+  }
 }
 
 document.getElementById('back-btn').addEventListener('click', () => {
