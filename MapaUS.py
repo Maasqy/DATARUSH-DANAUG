@@ -36,7 +36,7 @@ from shapely.strtree import STRtree
 
 import gemini_service
 
-st.set_page_config(page_title="Fifty States, One Territory", page_icon="\U0001F5FA", layout="wide")
+st.set_page_config(page_title="VITA NEX", page_icon="\U0001F5FA", layout="wide")
 
 # Transiciones del panel de Dashboards: st.container(key=...) expone su div
 # como clase CSS "st-key-<key>" (API oficial de Streamlit), asi que animamos
@@ -63,6 +63,13 @@ st.markdown(
        adentro (el dropdown de estado/condado, el mapa) -- ver el
        comentario junto a esos containers en el codigo. */
     .st-key-dash_charts_closing { animation: dashFadeOut 0.16s ease-in forwards; }
+    /* Rankings: mismo mecanismo que el panel de Dashboards de arriba, pero
+       sin necesidad de una key "closing" separada para el contenido interno
+       -- Rankings no tiene widgets con estado adentro (son listas armadas
+       en cada render a partir de MAP_DATA), asi que el contenedor entero
+       puede cambiar de key libremente sin perder nada. */
+    .st-key-rankings_section_open { animation: dashFadeIn 0.3s ease-out; }
+    .st-key-rankings_section_closing { animation: dashFadeOut 0.16s ease-in forwards; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -215,6 +222,10 @@ if "show_dashboard" not in st.session_state:
     st.session_state.show_dashboard = False
 if "dash_closing" not in st.session_state:
     st.session_state.dash_closing = False
+if "show_rankings" not in st.session_state:
+    st.session_state.show_rankings = False
+if "rankings_closing" not in st.session_state:
+    st.session_state.rankings_closing = False
 
 # Un click en el mapa (dentro de col_map, mas abajo) no puede escribir
 # directo en st.session_state["dash_mode"] / "dash_state_name" / etc: esos
@@ -464,6 +475,86 @@ def render_comparison_dashboard(abbrs):
         df_comp = pd.DataFrame(comp_series, index=list(COMPONENT_LABELS.values()))
         st.caption("Componentes de vulnerabilidad social (%) por estado")
         st.bar_chart(df_comp, horizontal=True, height=280)
+
+
+# --------------------------------------------------------------------
+# Rankings: dos vistas del mismo indicador (vulnerabilidad SDOH promedio
+# por estado, el mismo campo "vulnerability" que ya usa el resto de la app)
+# -- una lista general ordenada de mayor a menor, y esa misma lista agrupada
+# por banda de color. Los territorios sin dato (vulnerability=None: Samoa
+# Americana, Guam, Islas Marianas, Puerto Rico, Islas Virgenes en el
+# dataset actual) se excluyen de las dos, tal como se pidio.
+# --------------------------------------------------------------------
+def _ranked_state_vulnerabilities():
+    if not MAP_DATA:
+        return []
+    ranked = [
+        (abbr, STATES[abbr]["name"], entry["vulnerability"])
+        for abbr, entry in MAP_DATA["states"].items()
+        if abbr in STATES and entry.get("vulnerability") is not None
+    ]
+    ranked.sort(key=lambda row: row[2], reverse=True)
+    return ranked
+
+
+def render_rankings():
+    ranked = _ranked_state_vulnerabilities()
+    if not ranked:
+        st.info("No hay datos suficientes para armar los rankings.")
+        return
+
+    col_general, col_bands = st.columns(2, gap="large")
+
+    with col_general:
+        st.markdown("**Ranking general (promedio de vulnerabilidad por estado)**")
+        rows_html = "".join(
+            f"<div style='display:flex;justify-content:space-between;align-items:center;"
+            f"padding:5px 10px;background:{'#f7f7f5' if i % 2 else '#ffffff'};font-size:13px;'>"
+            f"<span>{i + 1}. {name}</span>"
+            f"<span style='display:inline-flex;align-items:center;gap:6px;color:#444;'>"
+            f"<span style='width:10px;height:10px;border-radius:3px;"
+            f"background:{vuln_band(v)['color']};display:inline-block;'></span>{v:.1f}</span>"
+            f"</div>"
+            for i, (abbr, name, v) in enumerate(ranked)
+        )
+        st.markdown(
+            f"<div style='border:1px solid #ddd;border-radius:8px;max-height:560px;"
+            f"overflow-y:auto;'>{rows_html}</div>",
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            f"{len(ranked)} estados/territorios con dato -- orden descendente, del peor "
+            f"promedio ({ranked[0][1]}) al mejor ({ranked[-1][1]})."
+        )
+
+    with col_bands:
+        st.markdown("**Ranking por banda de vulnerabilidad promedio**")
+        for band in VULN_BANDS:
+            # Dentro de cada banda, de menor a mayor -- menor vulnerabilidad
+            # es mejor, asi que ese va primero (al reves del orden del
+            # ranking general, que es de mayor a menor).
+            band_rows = sorted(
+                ((name, v) for _abbr, name, v in ranked if vuln_band(v) is band),
+                key=lambda row: row[1],
+            )
+            if not band_rows:
+                continue
+            items_html = "".join(
+                f"<div style='display:flex;justify-content:space-between;padding:3px 10px;"
+                f"font-size:13px;'><span>{i + 1}. {name}</span><span style='color:#555;'>{v:.1f}</span></div>"
+                for i, (name, v) in enumerate(band_rows)
+            )
+            st.markdown(
+                f"<div style='border:1px solid #ddd;border-radius:8px;padding:8px 0;margin-bottom:12px;'>"
+                f"<div style='display:flex;align-items:center;gap:8px;padding:0 10px 6px;"
+                f"border-bottom:1px solid #eee;'>"
+                f"<span style='width:14px;height:14px;border-radius:4px;background:{band['color']};"
+                f"display:inline-block;border:1px solid rgba(0,0,0,.15);'></span>"
+                f"<strong>{band['label']}</strong>"
+                f"<span style='color:#888;font-size:12px;'>({len(band_rows)})</span>"
+                f"</div>{items_html}</div>",
+                unsafe_allow_html=True,
+            )
 
 
 # --------------------------------------------------------------------
@@ -809,7 +900,12 @@ def render_ai_comparison_panel(abbrs):
     )
 
 
-st.title("Fifty States, One Territory")
+st.title("VITA NEX")
+st.markdown(
+    "<div style='font-size:1.05rem;color:#666;font-style:italic;margin-top:-8px;"
+    "margin-bottom:8px;'>See the bigger picture, connecting factors that shape health.</div>",
+    unsafe_allow_html=True,
+)
 st.caption(
     "Mapa nacional a resolucion ZCTA5 (codigo postal aproximado, ~33,300 formas), coloreado "
     "por banda de vulnerabilidad social. Haz click en un estado para ver sus condados, tambien "
@@ -1624,41 +1720,59 @@ def process_map_click(map_value):
 
 
 # --------------------------------------------------------------------
-# Boton "Dashboards": fuera del mapa, debajo del titulo/metricas. Al
-# activarlo aparecen los selectores (estado completo, o estado + condado)
-# y el mapa se parte con las graficas a la izquierda -- sin esto, la
-# pagina se comporta exactamente igual que antes (mapa a todo lo ancho).
+# Botones "Dashboards" y "Rankings": fuera del mapa, debajo del
+# titulo/metricas, uno al lado del otro. "Dashboards" abre los selectores
+# (estado completo, o estado + condado) y parte el mapa con las graficas a
+# la izquierda; "Rankings" abre las dos listas de vulnerabilidad de todos
+# los estados (mas abajo, ver render_rankings). Los dos son opt-in e
+# independientes -- sin tocar ninguno, la pagina se comporta exactamente
+# igual que antes (mapa a todo lo ancho, sin listas de rankings).
 # --------------------------------------------------------------------
-if st.button(
-    "Ocultar dashboards" if st.session_state.show_dashboard else "Dashboards",
-    icon=":material/close:" if st.session_state.show_dashboard else ":material/bar_chart:",
-    key="dashboards_toggle_btn",
-):
-    if st.session_state.show_dashboard:
-        # No lo ocultamos todavia: en este mismo render se pinta con la
-        # clase de "salida" (ver CSS arriba) para que se vea el fade-out, y
-        # recien despues de esa animacion lo quitamos de verdad (mas abajo).
-        st.session_state.dash_closing = True
-        # Streamlit puede acompanar este click con un reporte desactualizado
-        # del dropdown de estado (ej. si "Estado" se cargo por un click en
-        # el mapa y el usuario nunca toco el widget el mismo), lo que lo
-        # hace volver a su default (Alabama) justo al cerrar. Lo reforzamos
-        # aqui, desde el espejo que si sobrevive (active_state_abbr), antes
-        # de que el dropdown se vuelva a crear mas abajo en este mismo run.
-        _mirror_abbr = st.session_state.get("active_state_abbr")
-        if _mirror_abbr in STATES:
-            st.session_state["dash_state_name"] = STATES[_mirror_abbr]["name"]
-            _mirror_county = st.session_state.get("active_county_name")
-            st.session_state["dash_mode"] = "Estado y condado" if _mirror_county else "Estado completo"
-            if _mirror_county:
-                st.session_state[f"dash_county_name_{_mirror_abbr}"] = _mirror_county
-    else:
-        st.session_state.show_dashboard = True
-    # Sin este rerun explicito el boton se dibuja con la etiqueta vieja en
-    # este mismo render (Streamlit ya lo pinto antes de saber que se hizo
-    # click) y queda "atrasado" una pulsacion, aunque el panel de abajo si
-    # cambia al instante -- forzamos a que la etiqueta tambien se actualice ya.
-    st.rerun()
+_btn_dash_col, _btn_rank_col, _btn_spacer_col = st.columns([1, 1, 6], gap="small")
+with _btn_dash_col:
+    if st.button(
+        "Ocultar dashboards" if st.session_state.show_dashboard else "Dashboards",
+        icon=":material/close:" if st.session_state.show_dashboard else ":material/bar_chart:",
+        key="dashboards_toggle_btn",
+    ):
+        if st.session_state.show_dashboard:
+            # No lo ocultamos todavia: en este mismo render se pinta con la
+            # clase de "salida" (ver CSS arriba) para que se vea el fade-out, y
+            # recien despues de esa animacion lo quitamos de verdad (mas abajo).
+            st.session_state.dash_closing = True
+            # Streamlit puede acompanar este click con un reporte desactualizado
+            # del dropdown de estado (ej. si "Estado" se cargo por un click en
+            # el mapa y el usuario nunca toco el widget el mismo), lo que lo
+            # hace volver a su default (Alabama) justo al cerrar. Lo reforzamos
+            # aqui, desde el espejo que si sobrevive (active_state_abbr), antes
+            # de que el dropdown se vuelva a crear mas abajo en este mismo run.
+            _mirror_abbr = st.session_state.get("active_state_abbr")
+            if _mirror_abbr in STATES:
+                st.session_state["dash_state_name"] = STATES[_mirror_abbr]["name"]
+                _mirror_county = st.session_state.get("active_county_name")
+                st.session_state["dash_mode"] = "Estado y condado" if _mirror_county else "Estado completo"
+                if _mirror_county:
+                    st.session_state[f"dash_county_name_{_mirror_abbr}"] = _mirror_county
+        else:
+            st.session_state.show_dashboard = True
+        # Sin este rerun explicito el boton se dibuja con la etiqueta vieja en
+        # este mismo render (Streamlit ya lo pinto antes de saber que se hizo
+        # click) y queda "atrasado" una pulsacion, aunque el panel de abajo si
+        # cambia al instante -- forzamos a que la etiqueta tambien se actualice ya.
+        st.rerun()
+with _btn_rank_col:
+    if st.button(
+        "Ocultar rankings" if st.session_state.show_rankings else "Rankings",
+        icon=":material/close:" if st.session_state.show_rankings else ":material/leaderboard:",
+        key="rankings_toggle_btn",
+    ):
+        if st.session_state.show_rankings:
+            st.session_state.rankings_closing = True
+        else:
+            st.session_state.show_rankings = True
+        # Mismo truco que el boton de Dashboards: sin este rerun, la etiqueta
+        # del boton queda un click atrasada.
+        st.rerun()
 
 _dash_abbr = None
 _dash_county = None
@@ -1814,6 +1928,21 @@ if MAP_DATA:
         "las mismas bandas de color.</div>",
         unsafe_allow_html=True,
     )
+
+if st.session_state.show_rankings and MAP_DATA:
+    st.divider()
+    st.markdown("### Rankings de vulnerabilidad SDOH")
+    _rankings_key = "rankings_section_closing" if st.session_state.rankings_closing else "rankings_section_open"
+    with st.container(key=_rankings_key):
+        render_rankings()
+    if st.session_state.rankings_closing:
+        # Misma espera breve que usa el cierre de Dashboards, solo para que
+        # se alcance a ver el fade-out (ver CSS arriba) antes de sacar el
+        # bloque del todo.
+        time.sleep(0.16)
+        st.session_state.show_rankings = False
+        st.session_state.rankings_closing = False
+        st.rerun()
 
 # --------------------------------------------------------------------
 # Panel de IA fijo: vive fuera del bloque de arriba a proposito, para que
